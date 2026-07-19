@@ -3,7 +3,7 @@
 Streamlit에 의존하지 않으므로 단위 테스트에서 바로 import할 수 있다.
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 KST = ZoneInfo("Asia/Seoul")
@@ -23,8 +23,43 @@ def today_kst(now: datetime | None = None) -> date:
     return now_kst(now).date()
 
 
-def medication_day_count(start_date: date, today: date) -> int:
-    return (today - start_date).days + 1
+def medication_status(entries: list[tuple[date, str]]) -> dict:
+    """일별 약 복용 O/X 기록만으로 현재 복용 상태를 계산한다.
+
+    - 복용 중 여부: 가장 최근 O/X 기록이 O인지
+    - N일째: 가장 최근 기록부터 거슬러 올라가며 연속된 O의 개수
+      (X를 만나면 중단, 기록 없는 날 하루는 연속으로 인정)
+    entries의 순서는 무관하며 O/X 외의 값은 무시한다.
+    """
+    records = {}
+    for day, value in entries:
+        value = str(value).strip().upper()
+        if value in ("O", "X"):
+            records[day] = value
+
+    if not records:
+        return {"medicating": False, "day_count": 0}
+
+    latest = max(records)
+    if records[latest] != "O":
+        return {"medicating": False, "day_count": 0}
+
+    count = 0
+    missing_streak = 0
+    day = latest
+    while True:
+        value = records.get(day)
+        if value == "O":
+            count += 1
+            missing_streak = 0
+        elif value == "X":
+            break
+        else:
+            missing_streak += 1
+            if missing_streak > 1:
+                break
+        day -= timedelta(days=1)
+    return {"medicating": True, "day_count": count}
 
 CURRENT_COLUMNS = [
     "날짜",

@@ -1,5 +1,5 @@
 import html
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 
 import gspread
 import pandas as pd
@@ -16,7 +16,7 @@ from logic import (
     build_migrated_inbody_rows,
     build_migrated_rows,
     evaluate_guide,
-    medication_day_count,
+    medication_status,
     mood_fields_for,
     now_kst,
     today_kst,
@@ -398,21 +398,12 @@ def recent_days(df: pd.DataFrame, days: int) -> pd.DataFrame:
     return get_recent_records(df, days)
 
 
-def get_last_med_start_date(df: pd.DataFrame) -> date | None:
+def get_medication_status(df: pd.DataFrame) -> dict:
+    """일별 O/X 기록으로 현재 복용 상태를 계산한다. (복용 시작일 컬럼은 더 이상 쓰지 않음)"""
     if df.empty:
-        return None
-    candidates = df[df["복용 시작일"].astype(str).str.strip() != ""]
-    if candidates.empty:
-        return None
-    last_value = candidates.sort_values("날짜").iloc[-1]["복용 시작일"]
-    try:
-        return datetime.strptime(str(last_value), "%Y-%m-%d").date()
-    except ValueError:
-        return None
-
-
-def get_medication_day_count(start_date: date) -> int:
-    return medication_day_count(start_date, today_kst())
+        return {"medicating": False, "day_count": 0}
+    entries = list(zip(df["날짜"].dt.date, df["약 복용 여부"].astype(str)))
+    return medication_status(entries)
 
 
 def calc_pilates_external_stat(df: pd.DataFrame) -> str | None:
@@ -492,8 +483,7 @@ def build_guide_signals(df: pd.DataFrame) -> dict | None:
 
     evening = record["저녁 컨디션"]
     mood_score = record["mood_score"]
-    medicating = record["약 복용 여부"] == "O"
-    med_start = get_last_med_start_date(df)
+    med_status = get_medication_status(df)
     return {
         "pilates": record["운동 종류"] == "필라테스",
         "pilates_with_external": record["운동 종류"] == "필라테스" and record["외부 일정 여부"] == "있음",
@@ -502,8 +492,8 @@ def build_guide_signals(df: pd.DataFrame) -> dict | None:
         "evening_condition": None if pd.isna(evening) else int(evening),
         "severe_symptoms": severe_symptoms,
         "moderate_symptoms": moderate_symptoms,
-        "medicating": medicating,
-        "med_day_count": get_medication_day_count(med_start) if medicating and med_start else 0,
+        "medicating": med_status["medicating"],
+        "med_day_count": med_status["day_count"],
         "mood_score": None if pd.isna(mood_score) else int(mood_score),
     }
 
@@ -673,13 +663,13 @@ def render_evening_trend(df: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True, key="evening_trend_chart")
 
 
-def render_today_status_summary(exercise_type: str, evening_condition: int, med_day_count: int, streak: int) -> None:
+def render_today_status_summary(exercise_type: str, evening_condition: int, med_status: dict, streak: int) -> None:
     st.subheader("기록 요약")
     row1_col1, row1_col2 = st.columns(2)
     row2_col1, row2_col2 = st.columns(2)
     row1_col1.metric("🏃 운동", exercise_type)
     row1_col2.metric("🌙 저녁 컨디션", f"{evening_condition} / 5")
-    row2_col1.metric("💊 복용", f"{med_day_count}일째" if med_day_count > 0 else "-")
+    row2_col1.metric("💊 복용", f"{med_status['day_count']}일째" if med_status["medicating"] else "안 함")
     row2_col2.metric("🔥 연속 기록일", f"{streak}일")
 
 
@@ -807,16 +797,10 @@ def render_exercise_section(existing: pd.Series | None, history_df: pd.DataFrame
 def render_medication_section(existing: pd.Series | None, history_df: pd.DataFrame) -> dict:
     st.subheader("약 & 증상 체크")
     default_taken = existing is not None and existing["약 복용 여부"] == "O"
-    medication_taken = st.checkbox("오늘 약 복용", value=default_taken)
+    medication_taken = st.checkbox("약 복용", value=default_taken)
 
-    default_start = get_last_med_start_date(history_df) or today_kst()
-    if existing is not None and existing["복용 시작일"]:
-        try:
-            default_start = datetime.strptime(str(existing["복용 시작일"]), "%Y-%m-%d").date()
-        except ValueError:
-            pass
-    med_start_date = st.date_input("복용 시작일", value=default_start)
-    st.caption(f"복용 {get_medication_day_count(med_start_date)}일째")
+    med_status = get_medication_status(history_df)
+    st.caption(f"복용 {med_status['day_count']}일째" if med_status["medicating"] else "복용 안 함")
 
     st.markdown("**증상 체크**")
     symptom_fields = {}
@@ -835,7 +819,7 @@ def render_medication_section(existing: pd.Series | None, history_df: pd.DataFra
 
     return {
         "약 복용 여부": "O" if medication_taken else "X",
-        "복용 시작일": med_start_date.strftime("%Y-%m-%d"),
+        "복용 시작일": "",  # 컬럼은 보존하되 더 이상 사용하지 않음
         "증상_기타명": other_label,
         **symptom_fields,
     }
@@ -871,19 +855,11 @@ def render_record_form(existing: pd.Series | None, streak: int, history_df: pd.D
     if saved:
         summary_exercise = saved["운동 종류"]
         summary_evening = to_int(saved["저녁 컨디션"], exercise_fields["저녁 컨디션"])
-        summary_med_start = saved["복용 시작일"]
     else:
         summary_exercise = exercise_fields["운동 종류"]
         summary_evening = exercise_fields["저녁 컨디션"]
-        summary_med_start = medication_fields["복용 시작일"]
 
-    try:
-        med_start_date = datetime.strptime(str(summary_med_start), "%Y-%m-%d").date()
-        med_day_count = get_medication_day_count(med_start_date)
-    except ValueError:
-        med_day_count = 0
-
-    render_today_status_summary(summary_exercise, summary_evening, med_day_count, streak)
+    render_today_status_summary(summary_exercise, summary_evening, get_medication_status(history_df), streak)
 
 
 # delta_style — up_good: 증가=초록, down_good: 증가=주황/감소=초록, neutral: 회색

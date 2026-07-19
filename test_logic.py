@@ -13,7 +13,7 @@ from logic import (
     build_migrated_inbody_rows,
     build_migrated_rows,
     evaluate_guide,
-    medication_day_count,
+    medication_status,
     mood_fields_for,
     now_kst,
     today_kst,
@@ -263,11 +263,6 @@ class KstDateTest(unittest.TestCase):
         self.assertEqual((now.hour, now.minute), (8, 0))
         self.assertEqual(str(now.tzinfo), str(KST))
 
-    def test_medication_day_count_at_korean_morning(self):
-        # 7/18 복용 시작 → 한국 아침 8시(7/20)에는 3일째 (UTC 날짜로 계산하면 2일째로 밀림)
-        start = date(2026, 7, 18)
-        self.assertEqual(medication_day_count(start, today_kst(self.KOREAN_MORNING_8AM)), 3)
-
     def test_afternoon_utc_is_same_korean_day(self):
         # UTC 2026-07-19 14:59 = KST 23:59 → 아직 7/19
         afternoon = datetime(2026, 7, 19, 14, 59, tzinfo=timezone.utc)
@@ -277,6 +272,57 @@ class KstDateTest(unittest.TestCase):
         # UTC 15:00 = KST 자정 → 다음 날로 넘어감
         boundary = datetime(2026, 7, 19, 15, 0, tzinfo=timezone.utc)
         self.assertEqual(today_kst(boundary), date(2026, 7, 20))
+
+
+class MedicationStatusTest(unittest.TestCase):
+    def test_five_O_then_three_X_is_not_medicating(self):
+        # O 5일 연속(7/1~7/5) 후 X 3일(7/6~7/8) → 복용 안 함
+        entries = [(date(2026, 7, d), "O") for d in range(1, 6)]
+        entries += [(date(2026, 7, d), "X") for d in range(6, 9)]
+        status = medication_status(entries)
+        self.assertFalse(status["medicating"])
+        self.assertEqual(status["day_count"], 0)
+
+    def test_resume_after_break_starts_at_day_1(self):
+        # 위 시나리오에서 7/9에 다시 O → 복용 1일째로 새로 시작
+        entries = [(date(2026, 7, d), "O") for d in range(1, 6)]
+        entries += [(date(2026, 7, d), "X") for d in range(6, 9)]
+        entries.append((date(2026, 7, 9), "O"))
+        status = medication_status(entries)
+        self.assertTrue(status["medicating"])
+        self.assertEqual(status["day_count"], 1)
+
+    def test_consecutive_O_counts_days(self):
+        entries = [(date(2026, 7, d), "O") for d in range(1, 6)]
+        status = medication_status(entries)
+        self.assertTrue(status["medicating"])
+        self.assertEqual(status["day_count"], 5)
+
+    def test_one_missing_day_keeps_streak(self):
+        # O(7/1), O(7/2), 기록 없음(7/3), O(7/4) → 연속 인정, 3일째
+        entries = [(date(2026, 7, 1), "O"), (date(2026, 7, 2), "O"), (date(2026, 7, 4), "O")]
+        status = medication_status(entries)
+        self.assertTrue(status["medicating"])
+        self.assertEqual(status["day_count"], 3)
+
+    def test_two_missing_days_break_streak(self):
+        # O(7/1), 기록 없음(7/2~7/3), O(7/4) → 연속 끊김, 1일째
+        entries = [(date(2026, 7, 1), "O"), (date(2026, 7, 4), "O")]
+        status = medication_status(entries)
+        self.assertTrue(status["medicating"])
+        self.assertEqual(status["day_count"], 1)
+
+    def test_empty_or_blank_records(self):
+        self.assertEqual(medication_status([]), {"medicating": False, "day_count": 0})
+        entries = [(date(2026, 7, 1), ""), (date(2026, 7, 2), " ")]
+        self.assertEqual(medication_status(entries), {"medicating": False, "day_count": 0})
+
+    def test_blank_latest_is_skipped(self):
+        # 마지막 날 기록이 빈 값이면 그 이전의 O/X가 기준
+        entries = [(date(2026, 7, 1), "O"), (date(2026, 7, 2), "")]
+        status = medication_status(entries)
+        self.assertTrue(status["medicating"])
+        self.assertEqual(status["day_count"], 1)
 
 
 if __name__ == "__main__":
