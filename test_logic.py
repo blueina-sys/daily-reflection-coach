@@ -1,6 +1,8 @@
 import unittest
+from datetime import date, datetime, timedelta, timezone
 
 from logic import (
+    KST,
     CURRENT_COLUMNS,
     INBODY_CURRENT_COLUMNS,
     INBODY_V1_COLUMNS,
@@ -11,7 +13,10 @@ from logic import (
     build_migrated_inbody_rows,
     build_migrated_rows,
     evaluate_guide,
+    medication_day_count,
     mood_fields_for,
+    now_kst,
+    today_kst,
 )
 
 
@@ -218,6 +223,60 @@ class EvaluateGuideTest(unittest.TestCase):
     def test_evening_condition_boundary(self):
         self.assertEqual(evaluate_guide({"evening_condition": 2})["score"], 2)
         self.assertEqual(evaluate_guide({"evening_condition": 3})["score"], 0)
+
+    def test_pilates_without_external_is_info_only(self):
+        result = evaluate_guide(
+            {"pilates": True, "exercise_time": "10:00", "exercise_intensity": "보통"}
+        )
+        self.assertEqual(result["score"], 0)
+        self.assertEqual(result["level"], "green")
+        self.assertIn("어제 필라테스를 했어요 (10:00 · 보통)", result["reasons"])
+
+    def test_pilates_with_external_shows_single_bullet_with_detail(self):
+        result = evaluate_guide(
+            {
+                "pilates": True,
+                "pilates_with_external": True,
+                "exercise_time": "10:00",
+                "exercise_intensity": "힘듦",
+            }
+        )
+        self.assertEqual(result["score"], 2)
+        self.assertEqual(result["reasons"], ["어제 필라테스 후 외부 일정이 있었어요 (10:00 · 힘듦)"])
+
+
+class KstDateTest(unittest.TestCase):
+    """배포 서버가 UTC일 때 한국 아침 시간대의 날짜 계산 검증."""
+
+    # 한국 시간 2026-07-20 08:00 = UTC 2026-07-19 23:00
+    KOREAN_MORNING_8AM = datetime(2026, 7, 19, 23, 0, tzinfo=timezone.utc)
+
+    def test_today_is_korean_date_not_utc_date(self):
+        self.assertEqual(today_kst(self.KOREAN_MORNING_8AM), date(2026, 7, 20))
+
+    def test_yesterday_for_guide_is_korean_yesterday(self):
+        yesterday = today_kst(self.KOREAN_MORNING_8AM) - timedelta(days=1)
+        self.assertEqual(yesterday, date(2026, 7, 19))
+
+    def test_now_kst_clock_time(self):
+        now = now_kst(self.KOREAN_MORNING_8AM)
+        self.assertEqual((now.hour, now.minute), (8, 0))
+        self.assertEqual(str(now.tzinfo), str(KST))
+
+    def test_medication_day_count_at_korean_morning(self):
+        # 7/18 복용 시작 → 한국 아침 8시(7/20)에는 3일째 (UTC 날짜로 계산하면 2일째로 밀림)
+        start = date(2026, 7, 18)
+        self.assertEqual(medication_day_count(start, today_kst(self.KOREAN_MORNING_8AM)), 3)
+
+    def test_afternoon_utc_is_same_korean_day(self):
+        # UTC 2026-07-19 14:59 = KST 23:59 → 아직 7/19
+        afternoon = datetime(2026, 7, 19, 14, 59, tzinfo=timezone.utc)
+        self.assertEqual(today_kst(afternoon), date(2026, 7, 19))
+
+    def test_kst_midnight_boundary(self):
+        # UTC 15:00 = KST 자정 → 다음 날로 넘어감
+        boundary = datetime(2026, 7, 19, 15, 0, tzinfo=timezone.utc)
+        self.assertEqual(today_kst(boundary), date(2026, 7, 20))
 
 
 if __name__ == "__main__":

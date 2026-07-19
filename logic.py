@@ -1,7 +1,30 @@
-"""순수 데이터 로직: 시트 스키마 정의, 마이그레이션, 마음 날씨 점수 매핑.
+"""순수 데이터 로직: 시트 스키마 정의, 마이그레이션, 마음 날씨 점수 매핑, KST 시간 계산.
 
 Streamlit에 의존하지 않으므로 단위 테스트에서 바로 import할 수 있다.
 """
+
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
+
+KST = ZoneInfo("Asia/Seoul")
+
+
+def now_kst(now: datetime | None = None) -> datetime:
+    """현재 한국 시각. 배포 서버가 UTC여도 KST 기준으로 계산되도록 모든 시간은 여기서 얻는다.
+
+    now에 aware datetime을 주면 그 시각을 KST로 변환한다(테스트용).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return now.astimezone(KST)
+
+
+def today_kst(now: datetime | None = None) -> date:
+    return now_kst(now).date()
+
+
+def medication_day_count(start_date: date, today: date) -> int:
+    return (today - start_date).days + 1
 
 CURRENT_COLUMNS = [
     "날짜",
@@ -136,12 +159,24 @@ _MIGRATIONS = [
 # 새 신호(예: 수면 데이터)를 추가하려면 이 테이블에 규칙 하나만 더하면 된다.
 # applies: 신호 dict을 받아 해당 여부를 돌려주는 함수
 # reason: 점수에 기여한 이유 문장을 만드는 함수
+def _exercise_detail_suffix(signals: dict) -> str:
+    parts = [p for p in (signals.get("exercise_time"), signals.get("exercise_intensity")) if p]
+    return f" ({' · '.join(parts)})" if parts else ""
+
+
 GUIDE_RULES = [
     {
         "id": "pilates_with_external",
         "score": 2,
         "applies": lambda s: s.get("pilates_with_external", False),
-        "reason": lambda s: "어제 필라테스 후 외부 일정이 있었어요",
+        "reason": lambda s: f"어제 필라테스 후 외부 일정이 있었어요{_exercise_detail_suffix(s)}",
+    },
+    {
+        # 어제 필라테스 배지를 대체하는 정보성 불릿 (점수에는 영향 없음)
+        "id": "pilates_info",
+        "score": 0,
+        "applies": lambda s: s.get("pilates", False) and not s.get("pilates_with_external", False),
+        "reason": lambda s: f"어제 필라테스를 했어요{_exercise_detail_suffix(s)}",
     },
     {
         "id": "low_evening_condition",

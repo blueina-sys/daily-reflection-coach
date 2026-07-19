@@ -16,7 +16,10 @@ from logic import (
     build_migrated_inbody_rows,
     build_migrated_rows,
     evaluate_guide,
+    medication_day_count,
     mood_fields_for,
+    now_kst,
+    today_kst,
 )
 
 
@@ -295,6 +298,7 @@ def ensure_inbody_schema(worksheet) -> None:
     worksheet.update(f"A1:{last_col}{len(migrated_rows)}", migrated_rows)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def load_reflections() -> pd.DataFrame:
     worksheet = get_worksheet()
     rows = worksheet.get_all_records(expected_headers=COLUMNS)
@@ -312,6 +316,8 @@ def load_reflections() -> pd.DataFrame:
 
 def save_reflection(record: dict) -> str:
     worksheet = get_worksheet()
+    # 업서트 대상 행을 정확히 찾도록 캐시를 비우고 최신 데이터를 읽는다
+    load_reflections.clear()
     df = load_reflections()
     values = [record[column] for column in COLUMNS]
     record_date = record["날짜"]
@@ -320,12 +326,15 @@ def save_reflection(record: dict) -> str:
     if not df.empty and record_date in df["날짜"].dt.strftime("%Y-%m-%d").values:
         row_index = df.index[df["날짜"].dt.strftime("%Y-%m-%d") == record_date][0] + 2
         worksheet.update(f"A{row_index}:{last_col}{row_index}", [values])
+        load_reflections.clear()
         return "오늘 기록을 수정했습니다."
 
     worksheet.append_row(values, value_input_option="USER_ENTERED")
+    load_reflections.clear()
     return "새로운 기록을 저장했습니다."
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def load_inbody() -> pd.DataFrame:
     worksheet = get_inbody_worksheet()
     rows = worksheet.get_all_records(expected_headers=INBODY_COLUMNS)
@@ -342,6 +351,7 @@ def load_inbody() -> pd.DataFrame:
 
 def save_inbody(record: dict) -> str:
     worksheet = get_inbody_worksheet()
+    load_inbody.clear()
     df = load_inbody()
     values = [record[column] for column in INBODY_COLUMNS]
     record_date = record["날짜"]
@@ -350,9 +360,11 @@ def save_inbody(record: dict) -> str:
     if not df.empty and record_date in df["날짜"].dt.strftime("%Y-%m-%d").values:
         row_index = df.index[df["날짜"].dt.strftime("%Y-%m-%d") == record_date][0] + 2
         worksheet.update(f"A{row_index}:{last_col}{row_index}", [values])
+        load_inbody.clear()
         return "인바디 기록을 수정했습니다."
 
     worksheet.append_row(values, value_input_option="USER_ENTERED")
+    load_inbody.clear()
     return "인바디 기록을 저장했습니다."
 
 
@@ -368,7 +380,7 @@ def get_streak_days(df: pd.DataFrame) -> int:
     if df.empty:
         return 0
     recorded_dates = set(df["날짜"].dt.date)
-    current_day = date.today()
+    current_day = today_kst()
     streak = 0
     while current_day in recorded_dates:
         streak += 1
@@ -386,22 +398,6 @@ def recent_days(df: pd.DataFrame, days: int) -> pd.DataFrame:
     return get_recent_records(df, days)
 
 
-def get_yesterday_exercise(df: pd.DataFrame) -> dict | None:
-    if df.empty:
-        return None
-    yesterday = date.today() - timedelta(days=1)
-    matches = df[df["날짜"].dt.date == yesterday]
-    if matches.empty:
-        return None
-    record = matches.iloc[-1]
-    if record["운동 종류"] != "필라테스":
-        return None
-    return {
-        "운동 시간대": record["운동 시간대"],
-        "운동 강도": record["운동 강도"],
-    }
-
-
 def get_last_med_start_date(df: pd.DataFrame) -> date | None:
     if df.empty:
         return None
@@ -416,7 +412,7 @@ def get_last_med_start_date(df: pd.DataFrame) -> date | None:
 
 
 def get_medication_day_count(start_date: date) -> int:
-    return (date.today() - start_date).days + 1
+    return medication_day_count(start_date, today_kst())
 
 
 def calc_pilates_external_stat(df: pd.DataFrame) -> str | None:
@@ -478,7 +474,7 @@ def build_guide_signals(df: pd.DataFrame) -> dict | None:
     """어제 기록에서 오늘의 가이드 점수 계산에 쓸 신호들을 모은다. 어제 기록이 없으면 None."""
     if df.empty:
         return None
-    yesterday = date.today() - timedelta(days=1)
+    yesterday = today_kst() - timedelta(days=1)
     matches = df[df["날짜"].dt.date == yesterday]
     if matches.empty:
         return None
@@ -499,7 +495,10 @@ def build_guide_signals(df: pd.DataFrame) -> dict | None:
     medicating = record["약 복용 여부"] == "O"
     med_start = get_last_med_start_date(df)
     return {
+        "pilates": record["운동 종류"] == "필라테스",
         "pilates_with_external": record["운동 종류"] == "필라테스" and record["외부 일정 여부"] == "있음",
+        "exercise_time": str(record.get("운동 시간대", "")).strip(),
+        "exercise_intensity": str(record.get("운동 강도", "")).strip(),
         "evening_condition": None if pd.isna(evening) else int(evening),
         "severe_symptoms": severe_symptoms,
         "moderate_symptoms": moderate_symptoms,
@@ -512,7 +511,7 @@ def build_guide_signals(df: pd.DataFrame) -> dict | None:
 def had_recovery_yesterday(df: pd.DataFrame) -> bool:
     if df.empty or "recovery_tag" not in df:
         return False
-    yesterday = date.today() - timedelta(days=1)
+    yesterday = today_kst() - timedelta(days=1)
     matches = df[df["날짜"].dt.date == yesterday]
     return bool(matches["recovery_tag"].any()) if not matches.empty else False
 
@@ -539,7 +538,7 @@ def render_today_guide(df: pd.DataFrame) -> None:
         st.markdown(
             "<div class='guide-card guide-card-empty'>"
             "<div class='guide-card-label'>오늘의 가이드</div>"
-            "어제 기록이 없어 가이드를 만들 수 없었어요"
+            "어제 기록을 저장하면 오늘의 가이드를 알려드려요"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -568,7 +567,7 @@ def render_week_mood_strip(df: pd.DataFrame) -> None:
         for _, row in df.iterrows():
             mood_by_date[row["날짜"].date()] = str(row["마음 날씨"])
 
-    today = date.today()
+    today = today_kst()
     parts = []
     for offset in range(6, -1, -1):
         day = today - timedelta(days=offset)
@@ -674,20 +673,11 @@ def render_evening_trend(df: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True, key="evening_trend_chart")
 
 
-def render_yesterday_badge(df: pd.DataFrame) -> None:
-    yesterday_exercise = get_yesterday_exercise(df)
-    if not yesterday_exercise:
-        return
-    time_label = yesterday_exercise["운동 시간대"] or "시간 미기록"
-    intensity_label = yesterday_exercise["운동 강도"] or "강도 미기록"
-    st.info(f"🧘 어제 필라테스 ({time_label} · {intensity_label})")
-
-
 def render_today_status_summary(exercise_type: str, evening_condition: int, med_day_count: int, streak: int) -> None:
-    st.subheader("오늘 상태 요약")
+    st.subheader("기록 요약")
     row1_col1, row1_col2 = st.columns(2)
     row2_col1, row2_col2 = st.columns(2)
-    row1_col1.metric("🏃 오늘 운동", exercise_type)
+    row1_col1.metric("🏃 운동", exercise_type)
     row1_col2.metric("🌙 저녁 컨디션", f"{evening_condition} / 5")
     row2_col1.metric("💊 복용", f"{med_day_count}일째" if med_day_count > 0 else "-")
     row2_col2.metric("🔥 연속 기록일", f"{streak}일")
@@ -819,7 +809,7 @@ def render_medication_section(existing: pd.Series | None, history_df: pd.DataFra
     default_taken = existing is not None and existing["약 복용 여부"] == "O"
     medication_taken = st.checkbox("오늘 약 복용", value=default_taken)
 
-    default_start = get_last_med_start_date(history_df) or date.today()
+    default_start = get_last_med_start_date(history_df) or today_kst()
     if existing is not None and existing["복용 시작일"]:
         try:
             default_start = datetime.strptime(str(existing["복용 시작일"]), "%Y-%m-%d").date()
@@ -852,7 +842,9 @@ def render_medication_section(existing: pd.Series | None, history_df: pd.DataFra
 
 
 def render_record_form(existing: pd.Series | None, streak: int, history_df: pd.DataFrame) -> None:
-    selected_date = st.date_input("날짜", value=date.today())
+    # 아침 루틴: 기본값은 "어제 하루"에 대한 기록 (날짜를 바꾸면 그 날짜로 저장)
+    st.subheader("어제 하루 기록")
+    selected_date = st.date_input("날짜", value=today_kst() - timedelta(days=1))
     mood = render_mood_buttons(existing)
     st.divider()
     exercise_fields = render_exercise_section(existing, history_df)
@@ -861,7 +853,7 @@ def render_record_form(existing: pd.Series | None, streak: int, history_df: pd.D
     st.divider()
     reflection_fields = render_reflection_fields(existing)
 
-    if st.button("💾 오늘 기록 저장", use_container_width=True):
+    if st.button("💾 기록 저장", use_container_width=True):
         record = {
             "날짜": selected_date.strftime("%Y-%m-%d"),
             "마음 날씨": mood,
@@ -869,7 +861,7 @@ def render_record_form(existing: pd.Series | None, streak: int, history_df: pd.D
             **reflection_fields,
             **exercise_fields,
             **medication_fields,
-            "저장 시간": datetime.now().isoformat(timespec="seconds"),
+            "저장 시간": now_kst().isoformat(timespec="seconds"),
         }
         st.session_state["last_saved_record"] = record
         st.success(save_reflection(record))
@@ -998,7 +990,7 @@ def render_inbody_section(inbody_df: pd.DataFrame) -> None:
 
     col1, col2 = st.columns(2)
     with col1:
-        measured_date = st.date_input("측정 날짜", value=date.today(), key="inbody_date")
+        measured_date = st.date_input("측정 날짜", value=today_kst(), key="inbody_date")
         weight = st.number_input("체중 (kg)", min_value=0.0, step=0.1, format="%.1f", key="inbody_weight")
     with col2:
         muscle_mass = st.number_input("골격근량 (kg)", min_value=0.0, step=0.1, format="%.1f", key="inbody_muscle")
@@ -1014,7 +1006,7 @@ def render_inbody_section(inbody_df: pd.DataFrame) -> None:
                 "골격근량": muscle_mass,
                 "체지방률": "",
                 "body_fat_mass": fat_mass,
-                "저장 시간": datetime.now().isoformat(timespec="seconds"),
+                "저장 시간": now_kst().isoformat(timespec="seconds"),
             }
             st.success(save_inbody(record))
             st.rerun()
@@ -1047,16 +1039,16 @@ except Exception as exc:
     st.error(f"Google Sheets에서 기록을 불러오지 못했습니다: {exc}")
     st.stop()
 
-today_text = date.today().strftime("%Y-%m-%d")
-today_record = df[df["날짜"].dt.strftime("%Y-%m-%d") == today_text] if not df.empty else pd.DataFrame()
-existing_record = today_record.iloc[-1] if not today_record.empty else None
+# 기본 편집 대상은 어제(KST) 기록 — 이미 저장돼 있으면 폼에 미리 채워진다
+yesterday_text = (today_kst() - timedelta(days=1)).strftime("%Y-%m-%d")
+yesterday_record = df[df["날짜"].dt.strftime("%Y-%m-%d") == yesterday_text] if not df.empty else pd.DataFrame()
+existing_record = yesterday_record.iloc[-1] if not yesterday_record.empty else None
 streak = get_streak_days(df)
 
 today_tab, review_tab = st.tabs(["오늘", "돌아보기"])
 
 with today_tab:
     render_today_guide(df)
-    render_yesterday_badge(df)
     render_recovery_note(df)
     render_record_form(existing_record, streak, df)
 
