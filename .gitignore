@@ -1,0 +1,13 @@
+# 비밀 정보 — 절대 커밋 금지
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+
+# 작업용 폴더
+outputs/
+work/
+
+# 앱과 무관한 개인 메모
+260508.txt
