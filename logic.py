@@ -66,6 +66,37 @@ CURRENT_COLUMNS = [
     "마음 날씨",
     "mood_score",
     "recovery_tag",
+    "수면 점수",
+    "수면_지속시간",
+    "수면_취침시간",
+    "수면_중단",
+    "활력징후 이상",
+    "활력징후 메모",
+    "오늘 잘한 일",
+    "감사한 일",
+    "배운 점",
+    "내일 가장 중요한 한 가지",
+    "운동 종류",
+    "운동 시간대",
+    "운동 강도",
+    "외부 일정 여부",
+    "저녁 컨디션",
+    "약 복용 여부",
+    "복용 시작일",
+    "증상_구내염",
+    "증상_목아픔",
+    "증상_피로감",
+    "증상_기타명",
+    "증상_기타정도",
+    "저장 시간",
+]
+
+# 몸 신호(수면/활력징후) 도입 이전
+V3_COLUMNS = [
+    "날짜",
+    "마음 날씨",
+    "mood_score",
+    "recovery_tag",
     "오늘 잘한 일",
     "감사한 일",
     "배운 점",
@@ -184,10 +215,42 @@ def _legacy_transform(row: dict) -> dict:
 
 
 _MIGRATIONS = [
+    (V3_COLUMNS, None),
     (V2_COLUMNS, None),
     (V1_COLUMNS, None),
     (LEGACY_COLUMNS, _legacy_transform),
 ]
+
+
+# ---------- 수면 점수 ----------
+# min 이상이면 해당 구간. label은 입력 화면 안내, phrase는 가이드 카드 이유 문구,
+# score는 오늘의 가이드 점수. 기준을 바꾸려면 이 표만 고치면 된다.
+SLEEP_TIERS = [
+    {"min": 85, "label": "매우 좋음", "score": 0, "phrase": ""},
+    {"min": 70, "label": "양호", "score": 1, "phrase": "조금 아쉬웠어요"},
+    {"min": 50, "label": "부족", "score": 2, "phrase": "부족했어요"},
+    {"min": 0, "label": "많이 부족", "score": 3, "phrase": "많이 부족했어요"},
+]
+SLEEP_LOW_THRESHOLD = 70
+
+
+def sleep_tier(score) -> dict | None:
+    """수면 점수가 속한 구간을 돌려준다. 값이 없거나 숫자가 아니면 None."""
+    if score is None or score == "":
+        return None
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return None
+    for tier in SLEEP_TIERS:
+        if value >= tier["min"]:
+            return tier
+    return None
+
+
+def sleep_guide_score(score) -> int:
+    tier = sleep_tier(score)
+    return tier["score"] if tier else 0
 
 
 # ---------- 오늘의 가이드 ----------
@@ -200,6 +263,21 @@ def _exercise_detail_suffix(signals: dict) -> str:
 
 
 GUIDE_RULES = [
+    {
+        # score가 함수면 신호에 따라 점수가 달라진다 (수면 구간별 0~3점)
+        "id": "sleep",
+        "score": lambda s: sleep_guide_score(s.get("sleep_score")),
+        "applies": lambda s: sleep_guide_score(s.get("sleep_score")) > 0,
+        "reason": lambda s: (
+            f"어젯밤 수면 점수가 {s['sleep_score']}점으로 {sleep_tier(s['sleep_score'])['phrase']}"
+        ),
+    },
+    {
+        "id": "vital_abnormal",
+        "score": 3,
+        "applies": lambda s: s.get("vital_abnormal", False),
+        "reason": lambda s: "활력 징후 이상 알림이 있었어요",
+    },
     {
         "id": "pilates_with_external",
         "score": 2,
@@ -261,7 +339,8 @@ def evaluate_guide(signals: dict) -> dict:
     reasons = []
     for rule in GUIDE_RULES:
         if rule["applies"](signals):
-            score += rule["score"]
+            rule_score = rule["score"]
+            score += rule_score(signals) if callable(rule_score) else rule_score
             reasons.append(rule["reason"](signals))
 
     for min_score, emoji, level, headline, suggestion in GUIDE_LEVELS:
@@ -275,6 +354,33 @@ def evaluate_guide(signals: dict) -> dict:
                 "suggestion": suggestion,
             }
     raise AssertionError("GUIDE_LEVELS must cover score 0")
+
+
+SLEEP_EVENING_MIN_DAYS = 10
+
+
+def sleep_evening_gap(pairs: list[tuple], min_days: int = SLEEP_EVENING_MIN_DAYS) -> float | None:
+    """수면 점수가 낮았던 날의 저녁 컨디션이 평균 몇 점 낮았는지 계산한다.
+
+    pairs: (수면 점수, 저녁 컨디션) 목록. 둘 다 있는 날만 센다.
+    자료가 min_days 미만이거나 양쪽 그룹 중 하나가 비면 None(=표시하지 않음).
+    """
+    low, high = [], []
+    for sleep, evening in pairs:
+        if sleep is None or evening is None or sleep == "" or evening == "":
+            continue
+        try:
+            sleep_value = float(sleep)
+            evening_value = float(evening)
+        except (TypeError, ValueError):
+            continue
+        (low if sleep_value < SLEEP_LOW_THRESHOLD else high).append(evening_value)
+
+    if len(low) + len(high) < min_days or not low or not high:
+        return None
+
+    diff = sum(high) / len(high) - sum(low) / len(low)
+    return diff if diff > 0 else None
 
 
 def build_migrated_rows(values: list[list[str]]) -> list[list] | None:

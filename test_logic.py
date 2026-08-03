@@ -9,6 +9,10 @@ from logic import (
     LEGACY_COLUMNS,
     V1_COLUMNS,
     V2_COLUMNS,
+    V3_COLUMNS,
+    sleep_evening_gap,
+    sleep_guide_score,
+    sleep_tier,
     backfill_mood_fields,
     build_migrated_inbody_rows,
     build_migrated_rows,
@@ -272,6 +276,103 @@ class KstDateTest(unittest.TestCase):
         # UTC 15:00 = KST 자정 → 다음 날로 넘어감
         boundary = datetime(2026, 7, 19, 15, 0, tzinfo=timezone.utc)
         self.assertEqual(today_kst(boundary), date(2026, 7, 20))
+
+
+class SleepScoreTest(unittest.TestCase):
+    def test_tier_labels_and_scores(self):
+        cases = [
+            (100, "매우 좋음", 0),
+            (85, "매우 좋음", 0),
+            (84, "양호", 1),
+            (70, "양호", 1),
+            (69, "부족", 2),
+            (50, "부족", 2),
+            (49, "많이 부족", 3),
+            (0, "많이 부족", 3),
+        ]
+        for score, label, guide_score in cases:
+            self.assertEqual(sleep_tier(score)["label"], label, score)
+            self.assertEqual(sleep_guide_score(score), guide_score, score)
+
+    def test_missing_sleep_score_is_ignored(self):
+        for value in (None, "", "몰라"):
+            self.assertIsNone(sleep_tier(value), value)
+            self.assertEqual(sleep_guide_score(value), 0, value)
+
+    def test_guide_adds_sleep_points_with_reason(self):
+        result = evaluate_guide({"sleep_score": 45})
+        self.assertEqual(result["score"], 3)
+        self.assertEqual(result["level"], "yellow")
+        self.assertEqual(result["reasons"], ["어젯밤 수면 점수가 45점으로 많이 부족했어요"])
+
+    def test_guide_good_sleep_adds_nothing(self):
+        result = evaluate_guide({"sleep_score": 90})
+        self.assertEqual(result["score"], 0)
+        self.assertEqual(result["reasons"], [])
+
+    def test_guide_vital_abnormal(self):
+        result = evaluate_guide({"vital_abnormal": True})
+        self.assertEqual(result["score"], 3)
+        self.assertEqual(result["reasons"], ["활력 징후 이상 알림이 있었어요"])
+
+    def test_guide_sleep_and_vital_combine_to_red(self):
+        result = evaluate_guide({"sleep_score": 45, "vital_abnormal": True})
+        self.assertEqual(result["score"], 6)
+        self.assertEqual(result["level"], "red")
+        self.assertEqual(len(result["reasons"]), 2)
+
+    def test_guide_without_body_signals_is_unchanged(self):
+        # 과거 기록처럼 수면/활력징후 값이 없어도 오류 없이 기존 점수만 계산
+        result = evaluate_guide({"pilates_with_external": True})
+        self.assertEqual(result["score"], 2)
+
+
+class SleepEveningGapTest(unittest.TestCase):
+    def test_returns_gap_when_enough_data(self):
+        # 낮은 수면 5일(저녁 2점) + 높은 수면 5일(저녁 4점) → 2.0점 차이
+        pairs = [(60, 2)] * 5 + [(80, 4)] * 5
+        self.assertAlmostEqual(sleep_evening_gap(pairs), 2.0)
+
+    def test_hidden_when_fewer_than_10_days(self):
+        pairs = [(60, 2)] * 4 + [(80, 4)] * 5
+        self.assertIsNone(sleep_evening_gap(pairs))
+
+    def test_hidden_when_one_group_empty(self):
+        self.assertIsNone(sleep_evening_gap([(80, 4)] * 12))
+
+    def test_hidden_when_low_sleep_not_worse(self):
+        pairs = [(60, 4)] * 5 + [(80, 3)] * 5
+        self.assertIsNone(sleep_evening_gap(pairs))
+
+    def test_rows_with_missing_values_are_skipped(self):
+        pairs = [(60, 2)] * 5 + [(80, 4)] * 5 + [(None, 5), (70, None), ("", "")]
+        self.assertAlmostEqual(sleep_evening_gap(pairs), 2.0)
+
+    def test_threshold_boundary_70_counts_as_high(self):
+        pairs = [(69, 2)] * 5 + [(70, 4)] * 5
+        self.assertAlmostEqual(sleep_evening_gap(pairs), 2.0)
+
+
+class BodySignalMigrationTest(unittest.TestCase):
+    def test_v3_migration_leaves_body_signal_columns_empty(self):
+        source = dict(zip(V3_COLUMNS, [""] * len(V3_COLUMNS)))
+        source.update({"날짜": "2026-07-01", "마음 날씨": "맑음", "mood_score": "3", "저녁 컨디션": "4"})
+        migrated = build_migrated_rows([V3_COLUMNS, [source[c] for c in V3_COLUMNS]])
+
+        self.assertEqual(migrated[0], CURRENT_COLUMNS)
+        row = dict(zip(CURRENT_COLUMNS, migrated[1]))
+        self.assertEqual(row["날짜"], "2026-07-01")
+        self.assertEqual(row["저녁 컨디션"], "4")
+        self.assertEqual(row["수면 점수"], "")
+        self.assertEqual(row["활력징후 이상"], "")
+        self.assertEqual(row["활력징후 메모"], "")
+
+    def test_older_schema_still_migrates_to_current(self):
+        values = [LEGACY_COLUMNS, ["2026-04-01", "7", "3", "무지개", "발표", "반신욕"]]
+        row = dict(zip(CURRENT_COLUMNS, build_migrated_rows(values)[1]))
+        self.assertEqual(row["mood_score"], 3)
+        self.assertEqual(row["오늘 잘한 일"], "발표")
+        self.assertEqual(row["수면 점수"], "")
 
 
 class MedicationStatusTest(unittest.TestCase):

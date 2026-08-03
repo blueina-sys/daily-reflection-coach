@@ -13,12 +13,15 @@ from logic import (
     INBODY_CURRENT_COLUMNS as INBODY_COLUMNS,
     MOOD_EMOJI,
     MOOD_OPTIONS,
+    SLEEP_LOW_THRESHOLD,
+    SLEEP_TIERS,
     build_migrated_inbody_rows,
     build_migrated_rows,
     evaluate_guide,
     medication_status,
     mood_fields_for,
     now_kst,
+    sleep_evening_gap,
     today_kst,
 )
 
@@ -311,6 +314,10 @@ def load_reflections() -> pd.DataFrame:
     df["저녁 컨디션"] = pd.to_numeric(df["저녁 컨디션"], errors="coerce").astype("Int64")
     df["mood_score"] = pd.to_numeric(df["mood_score"], errors="coerce").astype("Int64")
     df["recovery_tag"] = df["recovery_tag"].astype(str).str.strip().str.upper().eq("TRUE")
+    # 몸 신호 — 과거 기록에는 값이 없어 비어 있을 수 있다(Int64로 결측 허용)
+    for column in ["수면 점수", "수면_지속시간", "수면_취침시간", "수면_중단"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce").astype("Int64")
+    df["활력징후 이상"] = df["활력징후 이상"].astype(str).str.strip().str.upper().eq("O")
     return df.sort_values("날짜")
 
 
@@ -461,6 +468,19 @@ def calc_medication_mood_pattern(df: pd.DataFrame) -> str | None:
     return f"약 복용 기간에는 마음 날씨가 더 흐린 편이었어요 (평균 {diff:.1f}점)"
 
 
+def calc_sleep_evening_pattern(df: pd.DataFrame) -> str | None:
+    if df.empty or "수면 점수" not in df:
+        return None
+    pairs = [
+        (None if pd.isna(sleep) else int(sleep), None if pd.isna(evening) else int(evening))
+        for sleep, evening in zip(df["수면 점수"], df["저녁 컨디션"])
+    ]
+    diff = sleep_evening_gap(pairs)
+    if diff is None:
+        return None
+    return f"수면 점수 {SLEEP_LOW_THRESHOLD} 미만인 날은 저녁 컨디션이 평균 {diff:.1f}점 낮았어요"
+
+
 def build_guide_signals(df: pd.DataFrame) -> dict | None:
     """어제 기록에서 오늘의 가이드 점수 계산에 쓸 신호들을 모은다. 어제 기록이 없으면 None."""
     if df.empty:
@@ -483,8 +503,11 @@ def build_guide_signals(df: pd.DataFrame) -> dict | None:
 
     evening = record["저녁 컨디션"]
     mood_score = record["mood_score"]
+    sleep_score = record["수면 점수"]
     med_status = get_medication_status(df)
     return {
+        "sleep_score": None if pd.isna(sleep_score) else int(sleep_score),
+        "vital_abnormal": bool(record["활력징후 이상"]),
         "pilates": record["운동 종류"] == "필라테스",
         "pilates_with_external": record["운동 종류"] == "필라테스" and record["외부 일정 여부"] == "있음",
         "exercise_time": str(record.get("운동 시간대", "")).strip(),
@@ -581,6 +604,9 @@ def render_pattern_section(df: pd.DataFrame) -> None:
     pilates_message = calc_pilates_external_stat(df)
     if pilates_message:
         messages.append(pilates_message)
+    sleep_message = calc_sleep_evening_pattern(df)
+    if sleep_message:
+        messages.append(sleep_message)
     messages.extend(calc_symptom_mood_patterns(df))
     medication_message = calc_medication_mood_pattern(df)
     if medication_message:
@@ -632,6 +658,50 @@ def render_symptom_timeline(df: pd.DataFrame) -> None:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
     st.plotly_chart(fig, use_container_width=True, key="symptom_timeline_chart")
+
+
+def render_sleep_trend(df: pd.DataFrame) -> None:
+    st.subheader("수면 점수 추이")
+    recent_30 = recent_days(df, 30)
+    if not recent_30.empty:
+        recent_30 = recent_30.dropna(subset=["수면 점수"])
+    if recent_30.empty:
+        st.info("기록이 쌓이면 수면 추이를 보여드려요")
+        return
+
+    fig = go.Figure(
+        go.Scatter(
+            x=recent_30["날짜"],
+            y=recent_30["수면 점수"],
+            mode="lines+markers",
+            name="수면 점수",
+            line=dict(width=3, color="#4c8a72"),
+        )
+    )
+
+    vital_days = recent_30[recent_30["활력징후 이상"]]
+    if not vital_days.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=vital_days["날짜"],
+                y=vital_days["수면 점수"],
+                mode="markers",
+                name="활력징후 이상",
+                marker=dict(size=14, color="#c96a55", symbol="x"),
+            )
+        )
+
+    fig.add_hline(y=SLEEP_LOW_THRESHOLD, line=dict(color="#c4cfc9", width=1, dash="dot"))
+    fig.update_layout(
+        title="최근 30일 수면 점수",
+        height=300,
+        margin=dict(l=8, r=8, t=52, b=20),
+        xaxis_title="날짜",
+        yaxis_title="점수",
+        yaxis=dict(range=[0, 100]),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    st.plotly_chart(fig, use_container_width=True, key="sleep_trend_chart")
 
 
 def render_evening_trend(df: pd.DataFrame) -> None:
@@ -736,6 +806,64 @@ def render_reflection_fields(existing: pd.Series | None) -> dict:
     }
 
 
+def _existing_int(existing: pd.Series | None, column: str) -> int | None:
+    if existing is None:
+        return None
+    value = existing.get(column)
+    return None if value is None or pd.isna(value) else int(value)
+
+
+def render_body_signal_section(existing: pd.Series | None) -> dict:
+    st.subheader("몸 신호")
+    sleep_score = st.number_input(
+        "수면 점수 (애플워치)",
+        min_value=0,
+        max_value=100,
+        step=1,
+        value=_existing_int(existing, "수면 점수"),
+        placeholder="0~100 점수를 입력해 주세요",
+    )
+    guide_lines = [f"{tier['min']} 이상 = {tier['label']}" for tier in SLEEP_TIERS[:-1]]
+    guide_lines.append(f"{SLEEP_TIERS[-2]['min']} 미만 = {SLEEP_TIERS[-1]['label']}")
+    st.markdown("<div class='guide-box'>" + "<br>".join(guide_lines) + "</div>", unsafe_allow_html=True)
+
+    with st.expander("수면 세부 점수 (선택)", expanded=False):
+        st.caption("비워두어도 저장됩니다. 나중에 어떤 요소가 컨디션에 영향이 큰지 살펴볼 때 쓰여요.")
+        detail_col1, detail_col2, detail_col3 = st.columns(3)
+        duration_score = detail_col1.number_input(
+            "지속 시간", min_value=0, max_value=100, step=1,
+            value=_existing_int(existing, "수면_지속시간"), placeholder="선택",
+        )
+        bedtime_score = detail_col2.number_input(
+            "취침 시간", min_value=0, max_value=100, step=1,
+            value=_existing_int(existing, "수면_취침시간"), placeholder="선택",
+        )
+        interruption_score = detail_col3.number_input(
+            "수면 중단", min_value=0, max_value=100, step=1,
+            value=_existing_int(existing, "수면_중단"), placeholder="선택",
+        )
+
+    default_vital = bool(existing["활력징후 이상"]) if existing is not None else False
+    vital_abnormal = st.checkbox("심박수·호흡수 이상 알림 있었음", value=default_vital)
+    vital_note = ""
+    if vital_abnormal:
+        vital_note = st.text_input(
+            "어떤 이상이었나요 (선택)",
+            value=str(existing["활력징후 메모"]) if existing is not None else "",
+            max_chars=100,
+            placeholder="예: 자는 중 심박수 알림",
+        )
+
+    return {
+        "수면 점수": "" if sleep_score is None else sleep_score,
+        "수면_지속시간": "" if duration_score is None else duration_score,
+        "수면_취침시간": "" if bedtime_score is None else bedtime_score,
+        "수면_중단": "" if interruption_score is None else interruption_score,
+        "활력징후 이상": "O" if vital_abnormal else "X",
+        "활력징후 메모": vital_note,
+    }
+
+
 def render_exercise_section(existing: pd.Series | None, history_df: pd.DataFrame) -> dict:
     st.subheader("운동 로그")
     exercise_default = (
@@ -831,6 +959,8 @@ def render_record_form(existing: pd.Series | None, streak: int, history_df: pd.D
     selected_date = st.date_input("날짜", value=today_kst() - timedelta(days=1))
     mood = render_mood_buttons(existing)
     st.divider()
+    body_signal_fields = render_body_signal_section(existing)
+    st.divider()
     exercise_fields = render_exercise_section(existing, history_df)
     st.divider()
     medication_fields = render_medication_section(existing, history_df)
@@ -838,18 +968,22 @@ def render_record_form(existing: pd.Series | None, streak: int, history_df: pd.D
     reflection_fields = render_reflection_fields(existing)
 
     if st.button("💾 기록 저장", use_container_width=True):
-        record = {
-            "날짜": selected_date.strftime("%Y-%m-%d"),
-            "마음 날씨": mood,
-            **mood_fields_for(mood),
-            **reflection_fields,
-            **exercise_fields,
-            **medication_fields,
-            "저장 시간": now_kst().isoformat(timespec="seconds"),
-        }
-        st.session_state["last_saved_record"] = record
-        st.success(save_reflection(record))
-        st.rerun()
+        if body_signal_fields["수면 점수"] == "":
+            st.warning("수면 점수를 입력해 주세요.")
+        else:
+            record = {
+                "날짜": selected_date.strftime("%Y-%m-%d"),
+                "마음 날씨": mood,
+                **mood_fields_for(mood),
+                **body_signal_fields,
+                **reflection_fields,
+                **exercise_fields,
+                **medication_fields,
+                "저장 시간": now_kst().isoformat(timespec="seconds"),
+            }
+            st.session_state["last_saved_record"] = record
+            st.success(save_reflection(record))
+            st.rerun()
 
     saved = st.session_state.get("last_saved_record")
     if saved:
@@ -1040,6 +1174,9 @@ with review_tab:
     st.divider()
 
     render_pattern_section(df)
+    st.divider()
+
+    render_sleep_trend(df)
     st.divider()
 
     render_symptom_timeline(df)
