@@ -10,6 +10,10 @@ from logic import (
     V1_COLUMNS,
     V2_COLUMNS,
     V3_COLUMNS,
+    V4_COLUMNS,
+    detect_ulcer_episodes,
+    mouth_ulcer_alert,
+    ulcer_response_comparison,
     sleep_evening_gap,
     sleep_guide_score,
     sleep_tier,
@@ -375,6 +379,205 @@ class BodySignalMigrationTest(unittest.TestCase):
         self.assertEqual(row["수면 점수"], "")
 
 
+def ulcer_entry(day: int, level: str, medicated: str = "X", hospital: str = "") -> dict:
+    return {"date": date(2026, 7, day), "level": level, "medicated": medicated, "hospital": hospital}
+
+
+class MouthUlcerAlertTest(unittest.TestCase):
+    def test_no_signal_hides_banner(self):
+        self.assertIsNone(mouth_ulcer_alert({}))
+        self.assertIsNone(mouth_ulcer_alert({"dry": False, "sting": False}))
+
+    def test_sting_is_red(self):
+        alert = mouth_ulcer_alert({"sting": True, "weekday": 0})
+        self.assertEqual(alert["level"], "red")
+        self.assertEqual(alert["headline"], "구내염 전조 가능성. 오늘 안에 대응하세요")
+        self.assertEqual(alert["notes"], [])
+
+    def test_sting_on_thursday_and_friday_adds_weekend_note(self):
+        for weekday in (3, 4):
+            alert = mouth_ulcer_alert({"sting": True, "weekday": weekday})
+            self.assertEqual(
+                alert["notes"], ["주말이 다가와요 — 병원 방문이나 약 시작을 미루지 마세요"], weekday
+            )
+
+    def test_dry_alone_is_not_enough(self):
+        self.assertIsNone(mouth_ulcer_alert({"dry": True, "mood_score": 3, "sleep_score": 90}))
+
+    def test_dry_with_each_trigger_is_yellow(self):
+        triggers = [
+            {"mood_score": 1},
+            {"sleep_score": 69},
+            {"fatigue_level": "보통"},
+            {"irritation": True},
+        ]
+        for trigger in triggers:
+            alert = mouth_ulcer_alert({"dry": True, **trigger})
+            self.assertEqual(alert["level"], "yellow", trigger)
+            self.assertEqual(alert["headline"], "구내염 주의 신호", trigger)
+            self.assertIn("물 충분히 마시기", alert["notes"])
+
+    def test_sting_takes_priority_over_dry(self):
+        alert = mouth_ulcer_alert({"dry": True, "sting": True, "sleep_score": 50, "weekday": 0})
+        self.assertEqual(alert["level"], "red")
+
+
+class DetectUlcerEpisodesTest(unittest.TestCase):
+    def test_no_episode_when_always_none(self):
+        entries = [ulcer_entry(d, "없음") for d in range(1, 6)]
+        self.assertEqual(detect_ulcer_episodes(entries), [])
+
+    def test_start_detected_on_transition_to_active(self):
+        entries = [ulcer_entry(1, "없음"), ulcer_entry(2, "없음"), ulcer_entry(3, "보통"), ulcer_entry(4, "심함")]
+        episodes = detect_ulcer_episodes(entries)
+        self.assertEqual(len(episodes), 1)
+        self.assertEqual(episodes[0]["start"], date(2026, 7, 3))
+        self.assertTrue(episodes[0]["ongoing"])
+        self.assertEqual(episodes[0]["duration_days"], 2)
+
+    def test_recovery_closes_episode(self):
+        entries = [ulcer_entry(1, "보통"), ulcer_entry(2, "심함"), ulcer_entry(3, "보통"), ulcer_entry(4, "없음")]
+        episode = detect_ulcer_episodes(entries)[0]
+        self.assertFalse(episode["ongoing"])
+        self.assertEqual(episode["duration_days"], 3)
+        self.assertEqual(episode["last_active"], date(2026, 7, 3))
+
+    def test_second_episode_gets_gap_days(self):
+        entries = [
+            ulcer_entry(1, "보통"), ulcer_entry(2, "없음"),
+            ulcer_entry(10, "보통"), ulcer_entry(11, "없음"),
+        ]
+        episodes = detect_ulcer_episodes(entries)
+        self.assertEqual(len(episodes), 2)
+        self.assertIsNone(episodes[0]["gap_days"])
+        self.assertEqual(episodes[1]["gap_days"], 9)
+
+    def test_med_start_is_derived_from_medication_records(self):
+        # 7/1 발생, 7/3부터 복용 시작 → 대응까지 2일, 병원 방문일도 같은 날로 본다
+        entries = [
+            ulcer_entry(1, "보통", medicated="X"),
+            ulcer_entry(2, "보통", medicated="X"),
+            ulcer_entry(3, "보통", medicated="O"),
+            ulcer_entry(4, "보통", medicated="O"),
+            ulcer_entry(5, "없음", medicated="O"),
+        ]
+        episode = detect_ulcer_episodes(entries)[0]
+        self.assertEqual(episode["med_start"], date(2026, 7, 3))
+        self.assertEqual(episode["hospital"], date(2026, 7, 3))
+        self.assertFalse(episode["hospital_is_manual"])
+        self.assertEqual(episode["response_days"], 2)
+        self.assertEqual(episode["delay_days"], 2)
+
+    def test_no_medication_means_not_responded_yet(self):
+        entries = [ulcer_entry(1, "보통"), ulcer_entry(2, "보통"), ulcer_entry(3, "없음")]
+        episode = detect_ulcer_episodes(entries)[0]
+        self.assertIsNone(episode["med_start"])
+        self.assertIsNone(episode["response_days"])
+        self.assertIsNone(episode["hospital"])
+
+    def test_medication_started_before_onset_gives_negative_response(self):
+        entries = [
+            ulcer_entry(1, "없음", medicated="O"),
+            ulcer_entry(2, "없음", medicated="O"),
+            ulcer_entry(3, "보통", medicated="O"),
+            ulcer_entry(4, "없음", medicated="O"),
+        ]
+        episode = detect_ulcer_episodes(entries)[0]
+        self.assertEqual(episode["med_start"], date(2026, 7, 1))
+        self.assertEqual(episode["response_days"], -2)
+
+    def test_manual_hospital_date_overrides_medication_date(self):
+        # 집에 있던 약을 7/1에 먼저 시작하고 병원은 7/4에 간 예외 상황
+        entries = [
+            ulcer_entry(1, "보통", medicated="O"),
+            ulcer_entry(2, "보통", medicated="O", hospital="2026-07-04"),
+            ulcer_entry(5, "없음"),
+        ]
+        episode = detect_ulcer_episodes(entries)[0]
+        self.assertEqual(episode["med_start"], date(2026, 7, 1))
+        self.assertEqual(episode["response_days"], 0)
+        self.assertEqual(episode["hospital"], date(2026, 7, 4))
+        self.assertTrue(episode["hospital_is_manual"])
+        self.assertEqual(episode["delay_days"], 3)
+
+    def test_invalid_manual_hospital_date_is_ignored(self):
+        entries = [ulcer_entry(1, "보통", medicated="O", hospital="몰라"), ulcer_entry(2, "없음")]
+        episode = detect_ulcer_episodes(entries)[0]
+        self.assertFalse(episode["hospital_is_manual"])
+        self.assertEqual(episode["hospital"], date(2026, 7, 1))
+
+    def test_previous_episode_medication_does_not_leak(self):
+        entries = [
+            ulcer_entry(1, "보통", medicated="O"),
+            ulcer_entry(2, "없음", medicated="O"),
+            ulcer_entry(3, "없음", medicated="X"),
+            ulcer_entry(10, "보통", medicated="X"),
+            ulcer_entry(11, "없음", medicated="X"),
+        ]
+        episodes = detect_ulcer_episodes(entries)
+        self.assertEqual(episodes[0]["med_start"], date(2026, 7, 1))
+        self.assertIsNone(episodes[1]["med_start"])
+
+    def test_unsorted_entries_are_handled(self):
+        entries = [ulcer_entry(4, "없음"), ulcer_entry(1, "보통"), ulcer_entry(2, "심함")]
+        episode = detect_ulcer_episodes(entries)[0]
+        self.assertEqual(episode["start"], date(2026, 7, 1))
+        self.assertEqual(episode["duration_days"], 2)
+
+
+class UlcerResponseComparisonTest(unittest.TestCase):
+    def test_none_when_too_few_episodes(self):
+        entries = [ulcer_entry(1, "보통", medicated="O"), ulcer_entry(2, "없음")]
+        self.assertIsNone(ulcer_response_comparison(detect_ulcer_episodes(entries)))
+
+    def test_fast_visits_show_shorter_duration(self):
+        episodes = [
+            {"delay_days": 0, "duration_days": 3, "ongoing": False},
+            {"delay_days": 1, "duration_days": 4, "ongoing": False},
+            {"delay_days": 5, "duration_days": 9, "ongoing": False},
+            {"delay_days": 6, "duration_days": 11, "ongoing": False},
+        ]
+        result = ulcer_response_comparison(episodes)
+        self.assertEqual(result["fast_count"], 2)
+        self.assertEqual(result["slow_count"], 2)
+        self.assertAlmostEqual(result["fast_avg_duration"], 3.5)
+        self.assertAlmostEqual(result["slow_avg_duration"], 10.0)
+
+    def test_ongoing_episode_is_excluded(self):
+        episodes = [
+            {"delay_days": 0, "duration_days": 3, "ongoing": False},
+            {"delay_days": 5, "duration_days": 2, "ongoing": True},
+        ]
+        self.assertIsNone(ulcer_response_comparison(episodes))
+
+    def test_none_when_all_delays_identical(self):
+        episodes = [
+            {"delay_days": 2, "duration_days": 5, "ongoing": False},
+            {"delay_days": 2, "duration_days": 7, "ongoing": False},
+        ]
+        self.assertIsNone(ulcer_response_comparison(episodes))
+
+
+class UlcerMigrationTest(unittest.TestCase):
+    def test_v4_migration_leaves_ulcer_columns_empty(self):
+        source = dict(zip(V4_COLUMNS, [""] * len(V4_COLUMNS)))
+        source.update({"날짜": "2026-08-01", "마음 날씨": "맑음", "수면 점수": "80", "증상_구내염": "보통"})
+        migrated = build_migrated_rows([V4_COLUMNS, [source[c] for c in V4_COLUMNS]])
+
+        self.assertEqual(migrated[0], CURRENT_COLUMNS)
+        row = dict(zip(CURRENT_COLUMNS, migrated[1]))
+        self.assertEqual(row["수면 점수"], "80")
+        self.assertEqual(row["증상_구내염"], "보통")
+        for column in ["입안 건조", "입안 따끔", "구강 자극", "구강 자극 종류", "구내염_병원방문일", "구내염_약시작일"]:
+            self.assertEqual(row[column], "", column)
+
+    def test_oldest_schema_still_reaches_current(self):
+        values = [LEGACY_COLUMNS, ["2026-04-01", "7", "3", "무지개", "발표", "반신욕"]]
+        row = dict(zip(CURRENT_COLUMNS, build_migrated_rows(values)[1]))
+        self.assertEqual(row["mood_score"], 3)
+        self.assertEqual(row["입안 건조"], "")
+
+
 class MedicationStatusTest(unittest.TestCase):
     def test_five_O_then_three_X_is_not_medicating(self):
         # O 5일 연속(7/1~7/5) 후 X 3일(7/6~7/8) → 복용 안 함
@@ -414,9 +617,23 @@ class MedicationStatusTest(unittest.TestCase):
         self.assertEqual(status["day_count"], 1)
 
     def test_empty_or_blank_records(self):
-        self.assertEqual(medication_status([]), {"medicating": False, "day_count": 0})
+        blank = {"medicating": False, "day_count": 0, "start_date": None}
+        self.assertEqual(medication_status([]), blank)
         entries = [(date(2026, 7, 1), ""), (date(2026, 7, 2), " ")]
-        self.assertEqual(medication_status(entries), {"medicating": False, "day_count": 0})
+        self.assertEqual(medication_status(entries), blank)
+
+    def test_start_date_is_first_day_of_current_streak(self):
+        # 7/1~7/5 복용 → 중단 → 7/9부터 다시 복용: 시작일은 7/9
+        entries = [(date(2026, 7, d), "O") for d in range(1, 6)]
+        entries += [(date(2026, 7, d), "X") for d in range(6, 9)]
+        entries += [(date(2026, 7, d), "O") for d in (9, 10)]
+        status = medication_status(entries)
+        self.assertEqual(status["start_date"], date(2026, 7, 9))
+        self.assertEqual(status["day_count"], 2)
+
+    def test_start_date_none_when_not_medicating(self):
+        entries = [(date(2026, 7, 1), "O"), (date(2026, 7, 2), "X")]
+        self.assertIsNone(medication_status(entries)["start_date"])
 
     def test_blank_latest_is_skipped(self):
         # 마지막 날 기록이 빈 값이면 그 이전의 O/X가 기준

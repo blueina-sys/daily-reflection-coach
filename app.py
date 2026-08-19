@@ -1,5 +1,5 @@
 import html
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 import gspread
 import pandas as pd
@@ -13,16 +13,23 @@ from logic import (
     INBODY_CURRENT_COLUMNS as INBODY_COLUMNS,
     MOOD_EMOJI,
     MOOD_OPTIONS,
+    ORAL_IRRITATION_TYPES,
     SLEEP_LOW_THRESHOLD,
     SLEEP_TIERS,
+    ULCER_ACTIVE_LEVELS,
+    ULCER_PATTERN_MIN_EPISODES,
+    ULCER_SIGNAL_WINDOW_DAYS,
     build_migrated_inbody_rows,
     build_migrated_rows,
     evaluate_guide,
+    detect_ulcer_episodes,
     medication_status,
     mood_fields_for,
+    mouth_ulcer_alert,
     now_kst,
     sleep_evening_gap,
     today_kst,
+    ulcer_response_comparison,
 )
 
 
@@ -44,6 +51,7 @@ MOOD_DESCRIPTIONS = {
 }
 
 EXERCISE_TYPES = ["필라테스", "걷기", "기타", "안 함"]
+ACTIVE_EXERCISE_TYPES = [t for t in EXERCISE_TYPES if t != "안 함"]
 INTENSITY_OPTIONS = ["가볍게", "보통", "힘듦"]
 EXTERNAL_SCHEDULE_OPTIONS = ["있음", "없음"]
 SYMPTOM_TYPES = ["구내염", "목 아픔", "피로감", "기타"]
@@ -318,6 +326,9 @@ def load_reflections() -> pd.DataFrame:
     for column in ["수면 점수", "수면_지속시간", "수면_취침시간", "수면_중단"]:
         df[column] = pd.to_numeric(df[column], errors="coerce").astype("Int64")
     df["활력징후 이상"] = df["활력징후 이상"].astype(str).str.strip().str.upper().eq("O")
+    # 구내염 추적 — 과거 기록에는 없던 컬럼이라 빈 값은 False로 읽힌다
+    for column in ["입안 건조", "입안 따끔", "구강 자극"]:
+        df[column] = df[column].astype(str).str.strip().str.upper().eq("O")
     return df.sort_values("날짜")
 
 
@@ -521,6 +532,42 @@ def build_guide_signals(df: pd.DataFrame) -> dict | None:
     }
 
 
+def get_ulcer_episodes(df: pd.DataFrame) -> list[dict]:
+    """저장된 증상 기록에서 구내염 발생 회차를 자동으로 찾아낸다."""
+    if df.empty:
+        return []
+    entries = [
+        {"date": day.date(), "level": level, "medicated": medicated, "hospital": hospital}
+        for day, level, medicated, hospital in zip(
+            df["날짜"], df["증상_구내염"], df["약 복용 여부"], df["구내염_병원방문일"]
+        )
+    ]
+    return detect_ulcer_episodes(entries)
+
+
+def build_ulcer_signals(df: pd.DataFrame) -> dict | None:
+    """어제 기록에서 구내염 배너 판단에 쓸 신호를 모은다. 어제 기록이 없으면 None."""
+    if df.empty:
+        return None
+    yesterday = today_kst() - timedelta(days=1)
+    matches = df[df["날짜"].dt.date == yesterday]
+    if matches.empty:
+        return None
+    record = matches.iloc[-1]
+
+    sleep_score = record["수면 점수"]
+    mood_score = record["mood_score"]
+    return {
+        "dry": bool(record["입안 건조"]),
+        "sting": bool(record["입안 따끔"]),
+        "irritation": bool(record["구강 자극"]),
+        "mood_score": None if pd.isna(mood_score) else int(mood_score),
+        "sleep_score": None if pd.isna(sleep_score) else int(sleep_score),
+        "fatigue_level": record[SYMPTOM_COLUMN_MAP["피로감"]],
+        "weekday": today_kst().weekday(),
+    }
+
+
 def had_recovery_yesterday(df: pd.DataFrame) -> bool:
     if df.empty or "recovery_tag" not in df:
         return False
@@ -569,6 +616,32 @@ def render_today_guide(df: pd.DataFrame) -> None:
         f"<div class='guide-card-headline'>{result['emoji']} {result['headline']}</div>"
         f"{reasons_html}"
         f"<div class='guide-card-suggestion'>{result['suggestion']}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_ulcer_banner(df: pd.DataFrame) -> None:
+    """구내염 전조/주의 배너. 조건에 걸리지 않으면 아무것도 그리지 않는다."""
+    signals = build_ulcer_signals(df)
+    if signals is None:
+        return
+    alert = mouth_ulcer_alert(signals)
+    if alert is None:
+        return
+
+    reasons_html = "".join(f"<li>{html.escape(reason)}</li>" for reason in alert["reasons"])
+    notes_html = ""
+    if alert["notes"]:
+        notes_html = (
+            "<div class='guide-card-suggestion'>" + " · ".join(html.escape(n) for n in alert["notes"]) + "</div>"
+        )
+    st.markdown(
+        f"<div class='guide-card guide-card-{alert['level']}'>"
+        f"<div class='guide-card-label'>구내염 신호</div>"
+        f"<div class='guide-card-headline'>{alert['emoji']} {alert['headline']}</div>"
+        f"<ul class='guide-card-reasons'>{reasons_html}</ul>"
+        f"{notes_html}"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -943,14 +1016,111 @@ def render_medication_section(existing: pd.Series | None, history_df: pd.DataFra
         level = st.select_slider(symptom, SYMPTOM_LEVELS, value=default_level)
         symptom_fields[column_name] = level
         if symptom == "기타":
-            other_label = st.text_input("기타 증상 이름", value=other_label)
+            other_label = st.text_input(
+                "기타 증상 이름",
+                value=other_label,
+                placeholder="약·구내염 외에 기록할 증상이 있다면",
+            )
+
+    oral_fields = render_oral_signal_inputs(existing)
+    ulcer_fields = render_ulcer_episode_log(
+        existing, history_df, symptom_fields[SYMPTOM_COLUMN_MAP["구내염"]]
+    )
 
     return {
         "약 복용 여부": "O" if medication_taken else "X",
         "복용 시작일": "",  # 컬럼은 보존하되 더 이상 사용하지 않음
         "증상_기타명": other_label,
         **symptom_fields,
+        **oral_fields,
+        **ulcer_fields,
     }
+
+
+def render_oral_signal_inputs(existing: pd.Series | None) -> dict:
+    """구내염 전조 신호 체크박스 3개."""
+    st.markdown("**입안 상태**")
+    dry = st.checkbox("입안 건조·이물감", value=bool(existing["입안 건조"]) if existing is not None else False)
+    sting = st.checkbox("입안 따끔·화끈", value=bool(existing["입안 따끔"]) if existing is not None else False)
+    irritation = st.checkbox("구강 자극 있었음", value=bool(existing["구강 자극"]) if existing is not None else False)
+
+    irritation_type = ""
+    if irritation:
+        default_index = 0
+        if existing is not None and existing["구강 자극 종류"] in ORAL_IRRITATION_TYPES:
+            default_index = ORAL_IRRITATION_TYPES.index(existing["구강 자극 종류"])
+        irritation_type = st.selectbox("어떤 자극이었나요", ORAL_IRRITATION_TYPES, index=default_index)
+
+    return {
+        "입안 건조": "O" if dry else "X",
+        "입안 따끔": "O" if sting else "X",
+        "구강 자극": "O" if irritation else "X",
+        "구강 자극 종류": irritation_type,
+    }
+
+
+def _date_or_none(value) -> date | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def render_ulcer_episode_log(existing: pd.Series | None, history_df: pd.DataFrame, ulcer_level: str) -> dict:
+    """발생일이 감지된 회차가 진행 중일 때만 병원 방문일·약 시작일 입력란을 보여준다."""
+    episodes = get_ulcer_episodes(history_df)
+    ongoing = episodes[-1] if episodes and episodes[-1]["ongoing"] else None
+
+    if ongoing is None and ulcer_level not in ULCER_ACTIVE_LEVELS:
+        return {"구내염_병원방문일": "", "구내염_약시작일": ""}
+
+    st.markdown("**구내염 대응 기록**")
+    if ongoing is not None:
+        st.markdown(
+            "<div class='guide-box'>" + "<br>".join(ulcer_summary_lines(ongoing, history_df)) + "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("저장하면 오늘이 발생일로 기록돼요.")
+
+    # 평소에는 약 복용 O/X 기록에서 병원 방문일을 자동으로 잡는다.
+    # 집에 있던 약을 먼저 시작한 경우처럼 날짜가 다를 때만 아래에서 직접 고친다.
+    default_hospital = _date_or_none(existing["구내염_병원방문일"]) if existing is not None else None
+    if default_hospital is None and ongoing is not None and ongoing["hospital_is_manual"]:
+        default_hospital = ongoing["hospital"]
+
+    with st.expander("병원 방문일이 약 시작일과 다른 경우", expanded=False):
+        st.caption("평소에는 비워두세요. 약 복용 기록에서 자동으로 계산합니다.")
+        hospital_date = st.date_input("병원 방문일 직접 입력", value=default_hospital, key="ulcer_hospital_date")
+
+    return {
+        "구내염_병원방문일": hospital_date.strftime("%Y-%m-%d") if hospital_date else "",
+        "구내염_약시작일": "",  # 컬럼은 보존하되 약 복용 기록에서 자동 계산
+    }
+
+
+def ulcer_summary_lines(episode: dict, history_df: pd.DataFrame) -> list[str]:
+    """대응 기록 요약 박스에 넣을 문장들을 만든다."""
+    lines = [f"발생일 {episode['start']:%Y-%m-%d} · 오늘로 {episode['duration_days']}일째"]
+    if episode["gap_days"] is not None:
+        lines.append(f"이전 발생 후 {episode['gap_days']}일 만")
+
+    response_days = episode["response_days"]
+    if response_days is None:
+        lines.append("아직 대응 전")
+    elif response_days < 0:
+        lines.append(f"발생 전부터 복용 중 ({episode['med_start']:%m/%d} 시작)")
+    else:
+        lines.append(f"대응까지 {response_days}일 걸림 ({episode['med_start']:%m/%d} 약 시작)")
+
+    med_status = get_medication_status(history_df)
+    lines.append(f"약 복용 {med_status['day_count']}일째" if med_status["medicating"] else "약 복용 안 함")
+    return lines
 
 
 def render_record_form(existing: pd.Series | None, streak: int, history_df: pd.DataFrame) -> None:
@@ -1124,6 +1294,140 @@ def render_inbody_section(inbody_df: pd.DataFrame) -> None:
     render_inbody_delta_metrics(inbody_df)
 
 
+# 발생 직전 구간에서 살펴볼 신호 표 — 항목을 더하려면 여기에 한 줄 추가하면 된다
+ULCER_WINDOW_SIGNALS = [
+    {
+        "label": "수면 부족",
+        "column": "수면 점수",
+        "present": lambda row: pd.notna(row["수면 점수"]) and row["수면 점수"] < SLEEP_LOW_THRESHOLD,
+        "text": lambda row: "-" if pd.isna(row["수면 점수"]) else str(int(row["수면 점수"])),
+    },
+    {
+        "label": "피로 상승",
+        "column": SYMPTOM_COLUMN_MAP["피로감"],
+        "present": lambda row: row[SYMPTOM_COLUMN_MAP["피로감"]] in ULCER_ACTIVE_LEVELS,
+        "text": lambda row: str(row[SYMPTOM_COLUMN_MAP["피로감"]] or "-"),
+    },
+    {
+        "label": "마음 날씨 흐림",
+        "column": "mood_score",
+        "present": lambda row: pd.notna(row["mood_score"]) and row["mood_score"] <= 1,
+        "text": lambda row: "-" if pd.isna(row["mood_score"]) else str(int(row["mood_score"])),
+    },
+    {
+        "label": "입안 건조",
+        "column": "입안 건조",
+        "present": lambda row: bool(row["입안 건조"]),
+        "text": lambda row: "O" if row["입안 건조"] else "-",
+    },
+    {
+        "label": "입안 따끔",
+        "column": "입안 따끔",
+        "present": lambda row: bool(row["입안 따끔"]),
+        "text": lambda row: "O" if row["입안 따끔"] else "-",
+    },
+    {
+        "label": "운동",
+        "column": "운동 종류",
+        "present": lambda row: row["운동 종류"] in ACTIVE_EXERCISE_TYPES,
+        "text": lambda row: str(row["운동 종류"] or "-"),
+    },
+    {
+        "label": "구강 자극",
+        "column": "구강 자극",
+        "present": lambda row: bool(row["구강 자극"]),
+        "text": lambda row: (str(row["구강 자극 종류"]) or "O") if row["구강 자극"] else "-",
+    },
+]
+
+
+def _ulcer_window_rows(df: pd.DataFrame, start_day) -> list:
+    """발생일 직전 구간(D-3~D0)의 기록 행을 날짜 순으로 돌려준다."""
+    rows = []
+    for offset in range(ULCER_SIGNAL_WINDOW_DAYS, -1, -1):
+        day = start_day - timedelta(days=offset)
+        matches = df[df["날짜"].dt.date == day]
+        rows.append((f"D-{offset}" if offset else "D0", day, None if matches.empty else matches.iloc[-1]))
+    return rows
+
+
+def render_ulcer_signal_table(df: pd.DataFrame, start_day) -> None:
+    table = {"날짜": [], **{signal["label"]: [] for signal in ULCER_WINDOW_SIGNALS}}
+    for label, day, row in _ulcer_window_rows(df, start_day):
+        table["날짜"].append(f"{label} ({day:%m/%d})")
+        for signal in ULCER_WINDOW_SIGNALS:
+            table[signal["label"]].append("기록 없음" if row is None else signal["text"](row))
+    st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
+
+
+def render_ulcer_common_signals(df: pd.DataFrame, episodes: list[dict]) -> None:
+    counts = {signal["label"]: 0 for signal in ULCER_WINDOW_SIGNALS}
+    for episode in episodes:
+        rows = [row for _, _, row in _ulcer_window_rows(df, episode["start"]) if row is not None]
+        for signal in ULCER_WINDOW_SIGNALS:
+            if any(signal["present"](row) for row in rows):
+                counts[signal["label"]] += 1
+
+    total = len(episodes)
+    lines = [f"{label} {count}/{total}회" for label, count in counts.items() if count]
+    if not lines:
+        return
+    st.markdown("**발생 직전 공통 신호**")
+    st.markdown("<div class='guide-box'>" + " · ".join(lines) + "</div>", unsafe_allow_html=True)
+
+
+def render_ulcer_pattern_section(df: pd.DataFrame) -> None:
+    with st.expander("🩹 구내염 패턴", expanded=False):
+        episodes = get_ulcer_episodes(df)
+        if not episodes:
+            st.caption("기록이 쌓이면 알려드려요")
+            return
+
+        latest = episodes[-1]
+        col1, col2, col3 = st.columns(3)
+        col1.metric("마지막 발생일", f"{latest['start']:%Y-%m-%d}")
+        col2.metric("이전 발생 후", "-" if latest["gap_days"] is None else f"{latest['gap_days']}일 만")
+        col3.metric(
+            "지속일수",
+            f"{latest['duration_days']}일" + (" (진행 중)" if latest["ongoing"] else ""),
+        )
+
+        gaps = [(episode["start"], episode["gap_days"]) for episode in episodes if episode["gap_days"] is not None]
+        if gaps:
+            st.markdown("**재발 간격 추이**")
+            fig = go.Figure(
+                go.Bar(
+                    x=[f"{start:%Y-%m-%d}" for start, _ in gaps],
+                    y=[gap for _, gap in gaps],
+                    marker_color="#4c8a72",
+                )
+            )
+            fig.update_layout(
+                height=260,
+                margin=dict(l=8, r=8, t=10, b=20),
+                xaxis_title="발생일",
+                yaxis_title="이전 발생과의 간격(일)",
+            )
+            st.plotly_chart(fig, use_container_width=True, key="ulcer_gap_chart")
+
+        st.markdown(f"**직전 신호 (D-{ULCER_SIGNAL_WINDOW_DAYS}~D0, {latest['start']:%Y-%m-%d} 발생)**")
+        render_ulcer_signal_table(df, latest["start"])
+
+        if len(episodes) >= ULCER_PATTERN_MIN_EPISODES:
+            render_ulcer_common_signals(df, episodes)
+
+        comparison = ulcer_response_comparison(episodes)
+        if comparison:
+            st.markdown("**대응 속도와 지속일수**")
+            st.markdown(
+                "<div class='guide-box'>"
+                f"병원에 빨리 갔던 {comparison['fast_count']}회는 평균 {comparison['fast_avg_duration']:.1f}일, "
+                f"늦었던 {comparison['slow_count']}회는 평균 {comparison['slow_avg_duration']:.1f}일 지속됐어요"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+
 def render_records_expander(df: pd.DataFrame) -> None:
     with st.expander("전체 기록 보기", expanded=False):
         if df.empty:
@@ -1159,6 +1463,7 @@ today_tab, review_tab = st.tabs(["오늘", "돌아보기"])
 
 with today_tab:
     render_today_guide(df)
+    render_ulcer_banner(df)
     render_recovery_note(df)
     render_record_form(existing_record, streak, df)
 
@@ -1180,6 +1485,7 @@ with review_tab:
     st.divider()
 
     render_symptom_timeline(df)
+    render_ulcer_pattern_section(df)
     st.divider()
 
     render_evening_trend(df)

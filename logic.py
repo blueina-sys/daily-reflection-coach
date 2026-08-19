@@ -23,35 +23,31 @@ def today_kst(now: datetime | None = None) -> date:
     return now_kst(now).date()
 
 
-def medication_status(entries: list[tuple[date, str]]) -> dict:
-    """일별 약 복용 O/X 기록만으로 현재 복용 상태를 계산한다.
-
-    - 복용 중 여부: 가장 최근 O/X 기록이 O인지
-    - N일째: 가장 최근 기록부터 거슬러 올라가며 연속된 O의 개수
-      (X를 만나면 중단, 기록 없는 날 하루는 연속으로 인정)
-    entries의 순서는 무관하며 O/X 외의 값은 무시한다.
-    """
+def _medication_records(entries: list[tuple[date, str]]) -> dict:
+    """(날짜, 값) 목록에서 O/X 기록만 골라 날짜별 dict으로 만든다."""
     records = {}
     for day, value in entries:
         value = str(value).strip().upper()
         if value in ("O", "X"):
             records[day] = value
+    return records
 
-    if not records:
-        return {"medicating": False, "day_count": 0}
 
-    latest = max(records)
-    if records[latest] != "O":
-        return {"medicating": False, "day_count": 0}
+def _medication_streak(records: dict, last_day: date) -> dict:
+    """last_day(복용 O인 날)에서 거슬러 올라가며 연속 복용 구간을 찾는다.
 
+    X를 만나면 중단하고, 기록 없는 날 하루는 연속으로 인정한다.
+    """
     count = 0
     missing_streak = 0
-    day = latest
+    day = last_day
+    start_day = last_day
     while True:
         value = records.get(day)
         if value == "O":
             count += 1
             missing_streak = 0
+            start_day = day
         elif value == "X":
             break
         else:
@@ -59,9 +55,79 @@ def medication_status(entries: list[tuple[date, str]]) -> dict:
             if missing_streak > 1:
                 break
         day -= timedelta(days=1)
-    return {"medicating": True, "day_count": count}
+    return {"day_count": count, "start_date": start_day}
+
+
+def medication_status(entries: list[tuple[date, str]]) -> dict:
+    """일별 약 복용 O/X 기록만으로 현재 복용 상태를 계산한다.
+
+    - 복용 중 여부: 가장 최근 O/X 기록이 O인지
+    - N일째: 가장 최근 기록부터 거슬러 올라가며 연속된 O의 개수
+    - start_date: 그 연속 구간의 첫 O가 기록된 날 (= 약 시작일 = 병원 방문일)
+    entries의 순서는 무관하며 O/X 외의 값은 무시한다.
+    """
+    records = _medication_records(entries)
+    if not records:
+        return {"medicating": False, "day_count": 0, "start_date": None}
+
+    latest = max(records)
+    if records[latest] != "O":
+        return {"medicating": False, "day_count": 0, "start_date": None}
+
+    streak = _medication_streak(records, latest)
+    return {"medicating": True, "day_count": streak["day_count"], "start_date": streak["start_date"]}
+
+
+def episode_medication_start(records: dict, start: date, last_active: date) -> date | None:
+    """회차 기간 안에서 처음 복용한 날을 찾아, 그 연속 구간의 시작일을 돌려준다.
+
+    회차 전부터 복용 중이었다면 그 구간의 시작일(발생일 이전)이 나온다.
+    """
+    day = start
+    while day <= last_active:
+        if records.get(day) == "O":
+            return _medication_streak(records, day)["start_date"]
+        day += timedelta(days=1)
+    return None
 
 CURRENT_COLUMNS = [
+    "날짜",
+    "마음 날씨",
+    "mood_score",
+    "recovery_tag",
+    "수면 점수",
+    "수면_지속시간",
+    "수면_취침시간",
+    "수면_중단",
+    "활력징후 이상",
+    "활력징후 메모",
+    "오늘 잘한 일",
+    "감사한 일",
+    "배운 점",
+    "내일 가장 중요한 한 가지",
+    "운동 종류",
+    "운동 시간대",
+    "운동 강도",
+    "외부 일정 여부",
+    "저녁 컨디션",
+    "약 복용 여부",
+    "복용 시작일",
+    "증상_구내염",
+    "증상_목아픔",
+    "증상_피로감",
+    "증상_기타명",
+    "증상_기타정도",
+    "입안 건조",
+    "입안 따끔",
+    "구강 자극",
+    "구강 자극 종류",
+    "구내염_병원방문일",
+    "구내염_약시작일",
+    "저장 시간",
+]
+
+# 구내염 추적 도입 이전
+V4_COLUMNS = [
     "날짜",
     "마음 날씨",
     "mood_score",
@@ -215,6 +281,7 @@ def _legacy_transform(row: dict) -> dict:
 
 
 _MIGRATIONS = [
+    (V4_COLUMNS, None),
     (V3_COLUMNS, None),
     (V2_COLUMNS, None),
     (V1_COLUMNS, None),
@@ -354,6 +421,159 @@ def evaluate_guide(signals: dict) -> dict:
                 "suggestion": suggestion,
             }
     raise AssertionError("GUIDE_LEVELS must cover score 0")
+
+
+# ---------- 구내염 추적 ----------
+ORAL_IRRITATION_TYPES = ["매운/짠", "뜨거운", "딱딱한/씹다 상처", "음주", "기타"]
+ULCER_ACTIVE_LEVELS = ("보통", "심함")
+ULCER_PATTERN_MIN_EPISODES = 3
+ULCER_SIGNAL_WINDOW_DAYS = 3  # 발생일 직전 며칠을 신호 구간으로 볼지 (D-3 ~ D0)
+
+# 🟡 주의 배너를 켜는 보조 신호 표. 신호를 더하거나 기준을 바꾸려면 여기만 고치면 된다.
+ULCER_WARNING_TRIGGERS = [
+    {
+        "id": "low_mood",
+        "label": "마음 날씨가 흐렸어요",
+        "applies": lambda s: s.get("mood_score") is not None and s["mood_score"] <= 1,
+    },
+    {
+        "id": "low_sleep",
+        "label": f"수면 점수가 {SLEEP_LOW_THRESHOLD} 미만이었어요",
+        "applies": lambda s: s.get("sleep_score") is not None and s["sleep_score"] < SLEEP_LOW_THRESHOLD,
+    },
+    {
+        "id": "fatigue",
+        "label": "피로감이 있었어요",
+        "applies": lambda s: s.get("fatigue_level") in ULCER_ACTIVE_LEVELS,
+    },
+    {
+        "id": "irritation",
+        "label": "구강 자극이 있었어요",
+        "applies": lambda s: bool(s.get("irritation")),
+    },
+]
+ULCER_WARNING_ACTIONS = ["물 충분히 마시기", "맵고 짠 음식 피하기", "운동 강도 낮추기"]
+WEEKEND_AHEAD_WEEKDAYS = (3, 4)  # 목(3), 금(4)
+
+
+def mouth_ulcer_alert(signals: dict) -> dict | None:
+    """구내염 전조/주의 배너 내용을 만든다. 조건에 걸리지 않으면 None(=배너 숨김)."""
+    if signals.get("sting"):
+        notes = []
+        if signals.get("weekday") in WEEKEND_AHEAD_WEEKDAYS:
+            notes.append("주말이 다가와요 — 병원 방문이나 약 시작을 미루지 마세요")
+        return {
+            "level": "red",
+            "emoji": "🔴",
+            "headline": "구내염 전조 가능성. 오늘 안에 대응하세요",
+            "reasons": ["입안이 따끔·화끈했어요"],
+            "notes": notes,
+        }
+
+    if signals.get("dry"):
+        reasons = [rule["label"] for rule in ULCER_WARNING_TRIGGERS if rule["applies"](signals)]
+        if reasons:
+            return {
+                "level": "yellow",
+                "emoji": "🟡",
+                "headline": "구내염 주의 신호",
+                "reasons": ["입안이 건조·이물감이 있었어요"] + reasons,
+                "notes": ULCER_WARNING_ACTIONS,
+            }
+    return None
+
+
+def _parse_date(value) -> date | None:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def detect_ulcer_episodes(entries: list[dict]) -> list[dict]:
+    """구내염 증상 기록에서 발생 회차를 자동으로 찾아낸다.
+
+    entries: [{"date": date, "level": "없음/보통/심함", "medicated": "O/X", "hospital": "YYYY-MM-DD"}]
+    '없음'에서 '보통 이상'으로 처음 바뀐 날이 발생일이고, 다시 '없음'이 되면 회복으로 본다.
+
+    약 시작일은 복용 O/X 기록에서 자동으로 찾는다(회차 중 첫 복용 구간의 시작일).
+    병원 방문일은 보통 약 시작일과 같으므로 그 값을 쓰고, hospital에 값이 있으면
+    예외 상황으로 보고 그 날짜로 덮어쓴다.
+    """
+    rows = sorted((e for e in entries if e.get("date")), key=lambda e: e["date"])
+    med_records = _medication_records([(row["date"], row.get("medicated", "")) for row in rows])
+
+    episodes = []
+    current = None
+    for row in rows:
+        active = str(row.get("level", "")).strip() in ULCER_ACTIVE_LEVELS
+        if active:
+            if current is None:
+                current = {"start": row["date"], "last_active": row["date"], "hospital": None}
+            else:
+                current["last_active"] = row["date"]
+            manual_hospital = _parse_date(row.get("hospital"))
+            if manual_hospital:
+                current["hospital"] = manual_hospital
+        elif current is not None:
+            episodes.append(current)
+            current = None
+
+    if current is not None:
+        current["ongoing"] = True
+        episodes.append(current)
+
+    results = []
+    for index, episode in enumerate(episodes):
+        start = episode["start"]
+        last_active = episode["last_active"]
+        med_start = episode_medication_start(med_records, start, last_active)
+        hospital = episode.get("hospital") or med_start
+        results.append(
+            {
+                "start": start,
+                "last_active": last_active,
+                "ongoing": episode.get("ongoing", False),
+                "duration_days": (last_active - start).days + 1,
+                "med_start": med_start,
+                "hospital": hospital,
+                "hospital_is_manual": episode.get("hospital") is not None,
+                "response_days": None if med_start is None else (med_start - start).days,
+                "delay_days": None if hospital is None else (hospital - start).days,
+                "gap_days": None if index == 0 else (start - episodes[index - 1]["start"]).days,
+            }
+        )
+    return results
+
+
+def ulcer_response_comparison(episodes: list[dict]) -> dict | None:
+    """병원 방문이 빨랐던 회차와 늦은 회차의 평균 지속일수를 비교한다.
+
+    비교할 회차가 부족하거나 한쪽 그룹이 비면 None(=표시하지 않음).
+    """
+    usable = [e for e in episodes if e.get("delay_days") is not None and not e.get("ongoing")]
+    if len(usable) < 2:
+        return None
+
+    delays = sorted(e["delay_days"] for e in usable)
+    middle = len(delays) // 2
+    threshold = delays[middle] if len(delays) % 2 else (delays[middle - 1] + delays[middle]) / 2
+
+    fast = [e for e in usable if e["delay_days"] <= threshold]
+    slow = [e for e in usable if e["delay_days"] > threshold]
+    if not fast or not slow:
+        return None
+
+    return {
+        "threshold": threshold,
+        "fast_count": len(fast),
+        "slow_count": len(slow),
+        "fast_avg_duration": sum(e["duration_days"] for e in fast) / len(fast),
+        "slow_avg_duration": sum(e["duration_days"] for e in slow) / len(slow),
+    }
 
 
 SLEEP_EVENING_MIN_DAYS = 10
