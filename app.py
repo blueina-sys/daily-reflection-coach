@@ -1,4 +1,5 @@
 import html
+import importlib
 from datetime import date, datetime, time, timedelta
 
 import gspread
@@ -7,6 +8,12 @@ import plotly.graph_objects as go
 import streamlit as st
 from google.oauth2.service_account import Credentials
 from gspread.utils import rowcol_to_a1
+
+import logic
+
+# 배포 후에도 logic.py의 옛 버전이 메모리에 남아 ImportError가 나는 것을 막는다.
+# (Streamlit은 app.py만 다시 읽고, app.py가 불러오는 파일은 다시 읽지 않는다)
+importlib.reload(logic)
 
 from logic import (
     CURRENT_COLUMNS as COLUMNS,
