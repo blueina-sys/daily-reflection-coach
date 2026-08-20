@@ -24,6 +24,8 @@ from logic import (
     SLEEP_LOW_THRESHOLD,
     SLEEP_TIERS,
     ULCER_ACTIVE_LEVELS,
+    ULCER_LEVEL_DESCRIPTIONS,
+    ULCER_LEVELS,
     ULCER_PATTERN_MIN_EPISODES,
     ULCER_SIGNAL_WINDOW_DAYS,
     build_migrated_inbody_rows,
@@ -35,6 +37,7 @@ from logic import (
     mouth_ulcer_alert,
     now_kst,
     sleep_evening_gap,
+    symptom_level_rank,
     today_kst,
     ulcer_response_comparison,
 )
@@ -359,6 +362,25 @@ def save_reflection(record: dict) -> str:
     return "새로운 기록을 저장했습니다."
 
 
+def update_reflection_cell(record_date: str, column: str, value: str) -> bool:
+    """이미 저장된 하루 기록에서 한 칸만 고쳐 쓴다. 해당 날짜 기록이 없으면 False."""
+    worksheet = get_worksheet()
+    load_reflections.clear()
+    df = load_reflections()
+    if df.empty:
+        return False
+
+    matches = df.index[df["날짜"].dt.strftime("%Y-%m-%d") == record_date]
+    if len(matches) == 0:
+        return False
+
+    row_index = matches[0] + 2
+    column_letter = _last_column_letter(COLUMNS.index(column) + 1)
+    worksheet.update(f"{column_letter}{row_index}", [[value]])
+    load_reflections.clear()
+    return True
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_inbody() -> pd.DataFrame:
     worksheet = get_inbody_worksheet()
@@ -509,15 +531,26 @@ def build_guide_signals(df: pd.DataFrame) -> dict | None:
         return None
     record = matches.iloc[-1]
 
+    # 구내염은 복용 여부에 따라 가중치가 달라서 별도 규칙으로 계산한다
     severe_symptoms = []
     moderate_symptoms = []
     for symptom in SYMPTOM_TYPES:
+        if symptom == "구내염":
+            continue
         level = record.get(SYMPTOM_COLUMN_MAP[symptom])
         name = symptom if symptom != "기타" else (str(record.get("증상_기타명", "")).strip() or "기타")
         if level == "심함":
             severe_symptoms.append(name)
         elif level == "보통":
             moderate_symptoms.append(name)
+
+    ulcer_level = record[SYMPTOM_COLUMN_MAP["구내염"]]
+    previous = df[df["날짜"].dt.date == yesterday - timedelta(days=1)]
+    ulcer_worsened = bool(
+        not previous.empty
+        and symptom_level_rank(ulcer_level)
+        > symptom_level_rank(previous.iloc[-1][SYMPTOM_COLUMN_MAP["구내염"]])
+    )
 
     evening = record["저녁 컨디션"]
     mood_score = record["mood_score"]
@@ -533,6 +566,8 @@ def build_guide_signals(df: pd.DataFrame) -> dict | None:
         "evening_condition": None if pd.isna(evening) else int(evening),
         "severe_symptoms": severe_symptoms,
         "moderate_symptoms": moderate_symptoms,
+        "ulcer_level": ulcer_level,
+        "ulcer_worsened": ulcer_worsened,
         "medicating": med_status["medicating"],
         "med_day_count": med_status["day_count"],
         "mood_score": None if pd.isna(mood_score) else int(mood_score),
@@ -544,9 +579,19 @@ def get_ulcer_episodes(df: pd.DataFrame) -> list[dict]:
     if df.empty:
         return []
     entries = [
-        {"date": day.date(), "level": level, "medicated": medicated, "hospital": hospital}
-        for day, level, medicated, hospital in zip(
-            df["날짜"], df["증상_구내염"], df["약 복용 여부"], df["구내염_병원방문일"]
+        {
+            "date": day.date(),
+            "level": level,
+            "medicated": medicated,
+            "hospital": hospital,
+            "onset_override": onset,
+        }
+        for day, level, medicated, hospital, onset in zip(
+            df["날짜"],
+            df["증상_구내염"],
+            df["약 복용 여부"],
+            df["구내염_병원방문일"],
+            df["구내염_발생일_수정"],
         )
     ]
     return detect_ulcer_episodes(entries)
@@ -564,7 +609,10 @@ def build_ulcer_signals(df: pd.DataFrame) -> dict | None:
 
     sleep_score = record["수면 점수"]
     mood_score = record["mood_score"]
+    med_status = get_medication_status(df)
     return {
+        "medicating": med_status["medicating"],
+        "med_day_count": med_status["day_count"],
         "dry": bool(record["입안 건조"]),
         "sting": bool(record["입안 따끔"]),
         "irritation": bool(record["구강 자극"]),
@@ -702,8 +750,9 @@ def render_pattern_section(df: pd.DataFrame) -> None:
 def render_symptom_timeline(df: pd.DataFrame) -> None:
     st.subheader("증상 발생 추이")
     recent_30 = recent_days(df, 30)
-    level_colors = {"보통": "#dfb75c", "심함": "#c96a55"}
-    points = {"보통": [], "심함": []}
+    # 구내염에만 있는 '경미'도 함께 보여준다 (연한 색)
+    level_colors = {"경미": "#cfd9d3", "보통": "#dfb75c", "심함": "#c96a55"}
+    points = {"경미": [], "보통": [], "심함": []}
     if not recent_30.empty:
         for _, row in recent_30.iterrows():
             for symptom in SYMPTOM_TYPES:
@@ -711,12 +760,12 @@ def render_symptom_timeline(df: pd.DataFrame) -> None:
                 if level in points:
                     points[level].append((row["날짜"], symptom))
 
-    if not points["보통"] and not points["심함"]:
+    if not any(points.values()):
         st.info("최근 30일 증상 기록이 없어요.")
         return
 
     fig = go.Figure()
-    for level in ("보통", "심함"):
+    for level in ("경미", "보통", "심함"):
         if not points[level]:
             continue
         dates, symptoms = zip(*points[level])
@@ -1015,13 +1064,20 @@ def render_medication_section(existing: pd.Series | None, history_df: pd.DataFra
     other_label = existing["증상_기타명"] if existing is not None else ""
     for symptom in SYMPTOM_TYPES:
         column_name = SYMPTOM_COLUMN_MAP[symptom]
+        # 구내염만 '경미'를 포함한 4단계로 기록한다
+        options = ULCER_LEVELS if symptom == "구내염" else SYMPTOM_LEVELS
         default_level = (
             existing[column_name]
-            if existing is not None and existing.get(column_name) in SYMPTOM_LEVELS
+            if existing is not None and existing.get(column_name) in options
             else "없음"
         )
-        level = st.select_slider(symptom, SYMPTOM_LEVELS, value=default_level)
+        level = st.select_slider(symptom, options, value=default_level)
         symptom_fields[column_name] = level
+        if symptom == "구내염":
+            guide = "<br>".join(
+                f"<b>{name}</b> {ULCER_LEVEL_DESCRIPTIONS[name]}" for name in ULCER_LEVELS
+            )
+            st.markdown(f"<div class='guide-box'>{guide}</div>", unsafe_allow_html=True)
         if symptom == "기타":
             other_label = st.text_input(
                 "기타 증상 이름",
@@ -1039,6 +1095,9 @@ def render_medication_section(existing: pd.Series | None, history_df: pd.DataFra
         "복용 시작일": "",  # 컬럼은 보존하되 더 이상 사용하지 않음
         "증상_기타명": other_label,
         **symptom_fields,
+        **ulcer_origin_field(existing, symptom_fields[SYMPTOM_COLUMN_MAP["구내염"]]),
+        # 발생일 수정은 돌아보기 탭의 구내염 패턴에서만 다룬다
+        "구내염_발생일_수정": str(existing["구내염_발생일_수정"]) if existing is not None else "",
         **oral_fields,
         **ulcer_fields,
     }
@@ -1109,6 +1168,15 @@ def render_ulcer_episode_log(existing: pd.Series | None, history_df: pd.DataFram
         "구내염_병원방문일": hospital_date.strftime("%Y-%m-%d") if hospital_date else "",
         "구내염_약시작일": "",  # 컬럼은 보존하되 약 복용 기록에서 자동 계산
     }
+
+
+def ulcer_origin_field(existing: pd.Series | None, level: str) -> dict:
+    """4단계 확장 전 원본 값을 보존하는 컬럼. 새로 저장하는 값은 그대로 원본이다."""
+    if existing is not None:
+        previous = str(existing.get("증상_구내염_원본", "")).strip()
+        if previous:
+            return {"증상_구내염_원본": previous}
+    return {"증상_구내염_원본": level}
 
 
 def ulcer_summary_lines(episode: dict, history_df: pd.DataFrame) -> list[str]:
@@ -1383,6 +1451,24 @@ def render_ulcer_common_signals(df: pd.DataFrame, episodes: list[dict]) -> None:
     st.markdown("<div class='guide-box'>" + " · ".join(lines) + "</div>", unsafe_allow_html=True)
 
 
+def render_ulcer_onset_override(episode: dict) -> None:
+    """자동 감지된 발생일이 실제와 다를 때 직접 고칠 수 있게 한다."""
+    with st.expander("발생일 직접 수정", expanded=False):
+        st.caption(
+            f"자동 감지: {episode['detected_start']:%Y-%m-%d}"
+            + (" (수정됨)" if episode["onset_is_manual"] else "")
+        )
+        new_start = st.date_input("실제 발생일", value=episode["start"], key="ulcer_onset_override")
+        if st.button("발생일 저장", key="ulcer_onset_save"):
+            target = episode["last_active"].strftime("%Y-%m-%d")
+            value = "" if new_start == episode["detected_start"] else new_start.strftime("%Y-%m-%d")
+            if update_reflection_cell(target, "구내염_발생일_수정", value):
+                st.success("발생일을 수정했습니다." if value else "자동 감지 값으로 되돌렸습니다.")
+                st.rerun()
+            else:
+                st.warning(f"{target} 기록을 찾지 못했어요.")
+
+
 def render_ulcer_pattern_section(df: pd.DataFrame) -> None:
     with st.expander("🩹 구내염 패턴", expanded=False):
         episodes = get_ulcer_episodes(df)
@@ -1422,6 +1508,8 @@ def render_ulcer_pattern_section(df: pd.DataFrame) -> None:
 
         if len(episodes) >= ULCER_PATTERN_MIN_EPISODES:
             render_ulcer_common_signals(df, episodes)
+
+        render_ulcer_onset_override(latest)
 
         comparison = ulcer_response_comparison(episodes)
         if comparison:

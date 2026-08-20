@@ -123,6 +123,45 @@ CURRENT_COLUMNS = [
     "구강 자극 종류",
     "구내염_병원방문일",
     "구내염_약시작일",
+    "증상_구내염_원본",
+    "구내염_발생일_수정",
+    "저장 시간",
+]
+
+# 구내염 4단계(경미 추가) 도입 이전
+V5_COLUMNS = [
+    "날짜",
+    "마음 날씨",
+    "mood_score",
+    "recovery_tag",
+    "수면 점수",
+    "수면_지속시간",
+    "수면_취침시간",
+    "수면_중단",
+    "활력징후 이상",
+    "활력징후 메모",
+    "오늘 잘한 일",
+    "감사한 일",
+    "배운 점",
+    "내일 가장 중요한 한 가지",
+    "운동 종류",
+    "운동 시간대",
+    "운동 강도",
+    "외부 일정 여부",
+    "저녁 컨디션",
+    "약 복용 여부",
+    "복용 시작일",
+    "증상_구내염",
+    "증상_목아픔",
+    "증상_피로감",
+    "증상_기타명",
+    "증상_기타정도",
+    "입안 건조",
+    "입안 따끔",
+    "구강 자극",
+    "구강 자극 종류",
+    "구내염_병원방문일",
+    "구내염_약시작일",
     "저장 시간",
 ]
 
@@ -281,6 +320,7 @@ def _legacy_transform(row: dict) -> dict:
 
 
 _MIGRATIONS = [
+    (V5_COLUMNS, None),
     (V4_COLUMNS, None),
     (V3_COLUMNS, None),
     (V2_COLUMNS, None),
@@ -365,10 +405,27 @@ GUIDE_RULES = [
         "reason": lambda s: f"어제 저녁 컨디션이 {s['evening_condition']}점이었어요",
     },
     {
+        # 구내염은 아래 ulcer_symptom 규칙에서 따로 계산한다
         "id": "severe_symptom",
         "score": 2,
         "applies": lambda s: bool(s.get("severe_symptoms")),
         "reason": lambda s: f"어제 {', '.join(s['severe_symptoms'])} 증상이 심했어요",
+    },
+    {
+        "id": "ulcer_symptom",
+        "score": lambda s: ulcer_guide_score(s.get("ulcer_level"), s.get("medicating", False)),
+        "applies": lambda s: ulcer_guide_score(s.get("ulcer_level"), s.get("medicating", False)) > 0,
+        "reason": lambda s: (
+            "어제 구내염 증상이 심했어요"
+            if symptom_level_rank(s.get("ulcer_level")) == SYMPTOM_LEVEL_RANK["심함"]
+            else "어제 구내염 증상이 가볍게 있었어요"
+        ),
+    },
+    {
+        "id": "ulcer_worsened_on_medication",
+        "score": 2,
+        "applies": lambda s: s.get("medicating", False) and s.get("ulcer_worsened", False),
+        "reason": lambda s: "약을 먹고 있는데 어제보다 증상이 심해졌어요",
     },
     {
         "id": "moderate_symptom",
@@ -425,7 +482,55 @@ def evaluate_guide(signals: dict) -> dict:
 
 # ---------- 구내염 추적 ----------
 ORAL_IRRITATION_TYPES = ["매운/짠", "뜨거운", "딱딱한/씹다 상처", "음주", "기타"]
-ULCER_ACTIVE_LEVELS = ("보통", "심함")
+# 구내염만 4단계로 기록한다(다른 증상은 SYMPTOM_LEVELS 3단계 유지)
+ULCER_LEVELS = ["없음", "경미", "보통", "심함"]
+ULCER_LEVEL_DESCRIPTIONS = {
+    "없음": "아무 느낌 없음",
+    "경미": "신경 쓰이지만 먹고 말하는 데 지장 없음",
+    "보통": "먹을 때 아픔, 자극적인 음식 피하게 됨",
+    "심함": "통증으로 식사·말하기 불편, 일상에 지장",
+}
+ULCER_ACTIVE_LEVELS = ("보통", "심함")  # 회차로 볼 단계 (경미는 상시 상태)
+SYMPTOM_LEVEL_RANK = {"": 0, "없음": 0, "경미": 1, "보통": 2, "심함": 3}
+ULCER_ONSET_RANK = SYMPTOM_LEVEL_RANK["보통"]
+ULCER_RECOVERY_STREAK_DAYS = 3  # '경미' 이하가 이만큼 이어지면 회차 종료
+
+# 과거 '보통' 기록은 실제로는 '경미'에 가까워 일괄 조정한다.
+# 이 날짜(포함)부터의 '보통'은 그대로 둔다.
+ULCER_LEVEL_FIX_CUTOFF = date(2026, 8, 14)
+
+
+def symptom_level_rank(level) -> int:
+    return SYMPTOM_LEVEL_RANK.get(str(level).strip(), 0)
+
+
+def ulcer_guide_score(level, medicating: bool) -> int:
+    """구내염 증상의 가이드 점수.
+
+    '경미'는 상시 상태로 보아 0점. 평소에는 '보통' +1, '심함' +2.
+    치료 중에는 증상이 남아 있는 게 자연스러우므로 '심함'만 +1로 낮춘다.
+    """
+    rank = symptom_level_rank(level)
+    if medicating:
+        return 1 if rank == SYMPTOM_LEVEL_RANK["심함"] else 0
+    return {0: 0, 1: 0, 2: 1, 3: 2}[rank]
+
+
+def backfill_ulcer_level(row: dict) -> dict:
+    """과거 '보통' 기록을 '경미'로 조정하고 원본 값을 보존한다.
+
+    원본 컬럼이 이미 채워져 있으면 변환이 끝난 행이므로 건드리지 않는다.
+    """
+    level = str(row.get("증상_구내염", "")).strip()
+    if not level or str(row.get("증상_구내염_원본", "")).strip():
+        return row
+
+    row["증상_구내염_원본"] = level
+    if level == "보통":
+        day = _parse_date(row.get("날짜"))
+        if day is not None and day < ULCER_LEVEL_FIX_CUTOFF:
+            row["증상_구내염"] = "경미"
+    return row
 ULCER_PATTERN_MIN_EPISODES = 3
 ULCER_SIGNAL_WINDOW_DAYS = 3  # 발생일 직전 며칠을 신호 구간으로 볼지 (D-3 ~ D0)
 
@@ -453,12 +558,32 @@ ULCER_WARNING_TRIGGERS = [
     },
 ]
 ULCER_WARNING_ACTIONS = ["물 충분히 마시기", "맵고 짠 음식 피하기", "운동 강도 낮추기"]
+# 이미 약을 먹는 중이면 '예방'이 아니라 '회복 중 관리'로 안내한다
+ULCER_RECOVERY_ACTIONS = ["물 충분히 마시기", "맵고 짠 음식 피하기", "약 거르지 않고 챙기기"]
+ULCER_RECHECK_NOTE = "새 병변이 생겼거나 3~4일 지나도 나아지지 않으면 재진을 고려하세요"
 WEEKEND_AHEAD_WEEKDAYS = (3, 4)  # 목(3), 금(4)
 
 
 def mouth_ulcer_alert(signals: dict) -> dict | None:
-    """구내염 전조/주의 배너 내용을 만든다. 조건에 걸리지 않으면 None(=배너 숨김)."""
+    """구내염 전조/주의 배너 내용을 만든다. 조건에 걸리지 않으면 None(=배너 숨김).
+
+    이미 약을 복용 중이면 증상이 남아 있는 게 자연스러우므로 경고 대신
+    경과 관찰 안내로 바꾼다(주말 경고도 띄우지 않는다).
+    """
+    medicating = bool(signals.get("medicating"))
+
     if signals.get("sting"):
+        if medicating:
+            day_count = signals.get("med_day_count") or 0
+            prefix = f"복용 {day_count}일째예요. " if day_count else ""
+            return {
+                "level": "yellow",
+                "emoji": "🟡",
+                "headline": "치료 중 · 경과 관찰",
+                "reasons": [f"{prefix}입안 따끔·화끈이 계속되고 있어요"],
+                "notes": [ULCER_RECHECK_NOTE],
+            }
+
         notes = []
         if signals.get("weekday") in WEEKEND_AHEAD_WEEKDAYS:
             notes.append("주말이 다가와요 — 병원 방문이나 약 시작을 미루지 마세요")
@@ -476,9 +601,9 @@ def mouth_ulcer_alert(signals: dict) -> dict | None:
             return {
                 "level": "yellow",
                 "emoji": "🟡",
-                "headline": "구내염 주의 신호",
+                "headline": "회복 중 관리" if medicating else "구내염 주의 신호",
                 "reasons": ["입안이 건조·이물감이 있었어요"] + reasons,
-                "notes": ULCER_WARNING_ACTIONS,
+                "notes": ULCER_RECOVERY_ACTIONS if medicating else ULCER_WARNING_ACTIONS,
             }
     return None
 
@@ -496,31 +621,47 @@ def _parse_date(value) -> date | None:
 def detect_ulcer_episodes(entries: list[dict]) -> list[dict]:
     """구내염 증상 기록에서 발생 회차를 자동으로 찾아낸다.
 
-    entries: [{"date": date, "level": "없음/보통/심함", "medicated": "O/X", "hospital": "YYYY-MM-DD"}]
-    '없음'에서 '보통 이상'으로 처음 바뀐 날이 발생일이고, 다시 '없음'이 되면 회복으로 본다.
+    entries: [{"date": date, "level": "없음/경미/보통/심함", "medicated": "O/X",
+               "hospital": "YYYY-MM-DD", "onset_override": "YYYY-MM-DD"}]
+
+    - '보통' 이상이 처음 나타난 날이 발생일 ('경미'는 상시 상태라 발생으로 보지 않는다)
+    - '경미' 이하가 ULCER_RECOVERY_STREAK_DAYS일 이어지면 회차 종료
+    - 구내염 값이 비어 있는 날은 '데이터 없음'으로 보고 판정에서 제외한다
+      (없음으로 간주하지 않으므로 기록을 건너뛴 날이 회차를 끊지 않는다)
 
     약 시작일은 복용 O/X 기록에서 자동으로 찾는다(회차 중 첫 복용 구간의 시작일).
     병원 방문일은 보통 약 시작일과 같으므로 그 값을 쓰고, hospital에 값이 있으면
-    예외 상황으로 보고 그 날짜로 덮어쓴다.
+    예외 상황으로 보고 그 날짜로 덮어쓴다. onset_override가 있으면 발생일을 그 날짜로 본다.
     """
     rows = sorted((e for e in entries if e.get("date")), key=lambda e: e["date"])
     med_records = _medication_records([(row["date"], row.get("medicated", "")) for row in rows])
 
     episodes = []
     current = None
+    calm_days = 0
     for row in rows:
-        active = str(row.get("level", "")).strip() in ULCER_ACTIVE_LEVELS
-        if active:
-            if current is None:
-                current = {"start": row["date"], "last_active": row["date"], "hospital": None}
-            else:
-                current["last_active"] = row["date"]
+        level = str(row.get("level", "")).strip()
+        if level:  # 기록이 있는 날만 발생/종료를 판정한다
+            if symptom_level_rank(level) >= ULCER_ONSET_RANK:
+                if current is None:
+                    current = {"start": row["date"], "last_active": row["date"], "hospital": None, "onset": None}
+                else:
+                    current["last_active"] = row["date"]
+                calm_days = 0
+            elif current is not None:
+                calm_days += 1
+                if calm_days >= ULCER_RECOVERY_STREAK_DAYS:
+                    episodes.append(current)
+                    current = None
+                    calm_days = 0
+
+        if current is not None:
             manual_hospital = _parse_date(row.get("hospital"))
             if manual_hospital:
                 current["hospital"] = manual_hospital
-        elif current is not None:
-            episodes.append(current)
-            current = None
+            manual_onset = _parse_date(row.get("onset_override"))
+            if manual_onset:
+                current["onset"] = manual_onset
 
     if current is not None:
         current["ongoing"] = True
@@ -528,7 +669,7 @@ def detect_ulcer_episodes(entries: list[dict]) -> list[dict]:
 
     results = []
     for index, episode in enumerate(episodes):
-        start = episode["start"]
+        start = episode.get("onset") or episode["start"]
         last_active = episode["last_active"]
         med_start = episode_medication_start(med_records, start, last_active)
         hospital = episode.get("hospital") or med_start
@@ -543,7 +684,13 @@ def detect_ulcer_episodes(entries: list[dict]) -> list[dict]:
                 "hospital_is_manual": episode.get("hospital") is not None,
                 "response_days": None if med_start is None else (med_start - start).days,
                 "delay_days": None if hospital is None else (hospital - start).days,
-                "gap_days": None if index == 0 else (start - episodes[index - 1]["start"]).days,
+                "detected_start": episode["start"],
+                "onset_is_manual": episode.get("onset") is not None,
+                "gap_days": (
+                    None
+                    if index == 0
+                    else (start - (episodes[index - 1].get("onset") or episodes[index - 1]["start"])).days
+                ),
             }
         )
     return results
@@ -624,6 +771,7 @@ def build_migrated_rows(values: list[list[str]]) -> list[list] | None:
             if transform:
                 transform(row)
             backfill_mood_fields(row)
+            backfill_ulcer_level(row)
             migrated.append([row.get(column, "") for column in CURRENT_COLUMNS])
         return migrated
     return None
